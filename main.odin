@@ -21,17 +21,19 @@ main :: proc() {
 	fmt.print("\x1b[?25l")
 
 	cursor, offset := 0, 0
+	msg: string
 	files, cwd := load()
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows := max(term_rows()-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, cursor, offset, rows)
+		draw(cwd, files, cursor, offset, rows, msg)
 
 		key, ok := read_key()
 		if !ok {
 			break
 		}
+		msg = "" // messages live exactly one frame, and must die before load() frees them
 
 		switch key {
 		case 'q', 3:
@@ -50,6 +52,31 @@ main :: proc() {
 			if os.set_working_directory("..") == nil {
 				cursor, offset = 0, 0
 				files, cwd = load()
+			}
+		case 'd':
+			if len(files) > 0 {
+				name := files[cursor].name
+				// remove() is rmdir for directories, so a non-empty one refuses to die. keep it that way.
+				if confirm(fmt.tprintf("delete %s? (y/N) ", name)) {
+					if err := os.remove(name); err != nil {
+						msg = fmt.tprintf("delete failed: %v", err)
+					} else {
+						files, cwd = load()
+						cursor = clamp(cursor, 0, max(len(files)-1, 0))
+					}
+				}
+			}
+		case 'r':
+			if len(files) > 0 {
+				old := files[cursor].name
+				if name, ok := ask("rename to: ", old); ok && name != old {
+					if err := os.rename(old, name); err != nil {
+						msg = fmt.tprintf("rename failed: %v", err)
+					} else {
+						files, cwd = load()
+						cursor = clamp(cursor, 0, max(len(files)-1, 0))
+					}
+				}
 			}
 		}
 	}
@@ -87,6 +114,44 @@ read_key :: proc() -> (key: byte, ok: bool) {
 	return key, true
 }
 
+// overwrites the bottom row in place, so prompts don't need the whole screen redrawn
+bar :: proc(text: string) {
+	fmt.printf("\x1b[%d;1H\x1b[2K\x1b[7m%s\x1b[0m", term_rows(), text)
+}
+
+// anything but y is no, because the y is the only key that deletes your file
+confirm :: proc(text: string) -> bool {
+	bar(text)
+	key, ok := read_key()
+	return ok && key == 'y'
+}
+
+// ponytail: no left/right editing in here, and arrows insert hjkl. it's a filename, not an essay.
+ask :: proc(label, initial: string) -> (answer: string, ok: bool) {
+	buf := make([dynamic]byte, 0, 64, context.temp_allocator)
+	append(&buf, initial)
+
+	for {
+		bar(fmt.tprintf("%s%s", label, string(buf[:])))
+
+		key, got := read_key()
+		if !got || key == 3 {
+			return "", false
+		}
+
+		switch {
+		case key == '\r' || key == '\n':
+			return string(buf[:]), len(buf) > 0
+		case key == 127:
+			if len(buf) > 0 {
+				pop(&buf)
+			}
+		case key >= 32 && key < 127:
+			append(&buf, key)
+		}
+	}
+}
+
 Winsize :: struct {
 	row, col, xpixel, ypixel: u16,
 }
@@ -100,8 +165,21 @@ term_rows :: proc() -> int {
 	return int(ws.row)
 }
 
+perms :: proc(p: os.Permissions) -> (out: [9]byte) {
+	flags := [9]os.Permission_Flag{
+		.Read_User, .Write_User, .Execute_User,
+		.Read_Group, .Write_Group, .Execute_Group,
+		.Read_Other, .Write_Other, .Execute_Other,
+	}
+	rwx := "rwxrwxrwx"
+	for f, i in flags {
+		out[i] = rwx[i] if f in p else '-'
+	}
+	return
+}
+
 // ponytail: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows: int) {
+draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows: int, msg: string) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", cwd)
 
@@ -122,10 +200,16 @@ draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows: int) {
 	}
 
 	// no trailing newline, printing one on the last row scrolls the whole screen up
+	if msg != "" {
+		fmt.printf("\x1b[7m %s \x1b[0m", msg)
+		return
+	}
+
 	f := files[cursor]
+	pp := perms(f.mode)
 	if f.type == .Directory {
-		fmt.printf("\x1b[7m dir  %d/%d \x1b[0m", cursor+1, len(files))
+		fmt.printf("\x1b[7m %s  dir  %d/%d \x1b[0m", string(pp[:]), cursor+1, len(files))
 	} else {
-		fmt.printf("\x1b[7m %M  %d/%d \x1b[0m", f.size, cursor+1, len(files))
+		fmt.printf("\x1b[7m %s  %M  %d/%d \x1b[0m", string(pp[:]), f.size, cursor+1, len(files))
 	}
 }
