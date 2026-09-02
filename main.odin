@@ -3,6 +3,7 @@ package gunti
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:sys/linux"
 import "core:sys/posix"
 
 main :: proc() {
@@ -19,10 +20,13 @@ main :: proc() {
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &raw)
 	fmt.print("\x1b[?25l")
 
-	cursor := 0
+	cursor, offset := 0, 0
 	files, cwd := load()
 	for {
-		draw(cwd, files, cursor)
+		// re-asked every frame so a resized window just works, no sigwinch handler
+		rows := max(term_rows()-2, 1)
+		offset = max(min(offset, cursor), cursor-rows+1, 0)
+		draw(cwd, files, cursor, offset, rows)
 
 		key, ok := read_key()
 		if !ok {
@@ -39,12 +43,12 @@ main :: proc() {
 		// chdir just fails on a regular file, so no type check needed and symlinked dirs work free
 		case 'l', '\r', '\n':
 			if len(files) > 0 && os.set_working_directory(files[cursor].name) == nil {
-				cursor = 0
+				cursor, offset = 0, 0
 				files, cwd = load()
 			}
 		case 'h', 127:
 			if os.set_working_directory("..") == nil {
-				cursor = 0
+				cursor, offset = 0, 0
 				files, cwd = load()
 			}
 		}
@@ -83,22 +87,45 @@ read_key :: proc() -> (key: byte, ok: bool) {
 	return key, true
 }
 
-// ponytail: full redraw per keypress, diff the rows if a listing ever outgrows the screen
-draw :: proc(cwd: string, files: []os.File_Info, cursor: int) {
+Winsize :: struct {
+	row, col, xpixel, ypixel: u16,
+}
+
+// core ships TIOCGWINSZ but no winsize struct, so it lives here
+term_rows :: proc() -> int {
+	ws: Winsize
+	if linux.ioctl(linux.Fd(posix.STDOUT_FILENO), linux.TIOCGWINSZ, uintptr(&ws)) != 0 || ws.row == 0 {
+		return 24 // ponytail: not a tty, assume the ancient default
+	}
+	return int(ws.row)
+}
+
+// ponytail: full redraw per keypress, diff the rows if it ever feels slow
+draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows: int) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", cwd)
 
 	if len(files) == 0 {
-		fmt.println("(empty or unreadable)")
+		fmt.print("(empty or unreadable)")
 		return
 	}
 
-	for f, i in files {
+	// ponytail: names wider than the terminal wrap and throw the row count off, truncate when it annoys
+	for i in offset ..< min(offset+rows, len(files)) {
+		f := files[i]
 		slash := "/" if f.type == .Directory else ""
 		if i == cursor {
 			fmt.printfln("\x1b[7m%s%s\x1b[0m", f.name, slash)
 		} else {
 			fmt.printfln("%s%s", f.name, slash)
 		}
+	}
+
+	// no trailing newline, printing one on the last row scrolls the whole screen up
+	f := files[cursor]
+	if f.type == .Directory {
+		fmt.printf("\x1b[7m dir  %d/%d \x1b[0m", cursor+1, len(files))
+	} else {
+		fmt.printf("\x1b[7m %M  %d/%d \x1b[0m", f.size, cursor+1, len(files))
 	}
 }
