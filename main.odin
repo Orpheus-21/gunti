@@ -7,12 +7,12 @@ import "core:sys/linux"
 import "core:sys/posix"
 
 main :: proc() {
-	orig: posix.termios
-	posix.tcgetattr(posix.STDIN_FILENO, &orig)
-	defer posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &orig)
+	cooked: posix.termios
+	posix.tcgetattr(posix.STDIN_FILENO, &cooked)
+	defer posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &cooked)
 	defer fmt.print("\x1b[2J\x1b[H\x1b[?25h")
 
-	raw := orig
+	raw := cooked
 	// isig off so ctrl-c arrives as byte 3 instead of killing us mid-raw-mode
 	raw.c_lflag -= {.ECHO, .ICANON, .ISIG}
 	raw.c_cc[.VMIN] = 1
@@ -21,13 +21,15 @@ main :: proc() {
 	fmt.print("\x1b[?25l")
 
 	cursor, offset := 0, 0
+	show_hidden := false
 	msg: string
-	files, cwd := load()
+	files, cwd := load(show_hidden)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
-		rows := max(term_rows()-2, 1)
+		rows, cols := term_size()
+		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, cursor, offset, rows, msg)
+		draw(cwd, files, cursor, offset, rows, cols, msg)
 
 		key, ok := read_key()
 		if !ok {
@@ -42,16 +44,37 @@ main :: proc() {
 			cursor = min(cursor+1, len(files)-1)
 		case 'k':
 			cursor = max(cursor-1, 0)
-		// chdir just fails on a regular file, so no type check needed and symlinked dirs work free
+		case 'g':
+			cursor = 0
+		case 'G':
+			cursor = max(len(files)-1, 0)
+		case '.':
+			show_hidden = !show_hidden
+			cursor, offset = 0, 0
+			files, cwd = load(show_hidden)
 		case 'l', '\r', '\n':
-			if len(files) > 0 && os.set_working_directory(files[cursor].name) == nil {
-				cursor, offset = 0, 0
-				files, cwd = load()
+			if len(files) > 0 {
+				// try to walk in first: chdir fails on a regular file, and symlinked dirs work free
+				eerr: os.Error
+				// ponytail: a dir we lack permission to enter also lands here and gets handed to the editor
+				if os.set_working_directory(files[cursor].name) == nil {
+					cursor, offset = 0, 0
+				} else {
+					eerr = open_in_editor(files[cursor].name, &cooked, &raw)
+				}
+				files, cwd = load(show_hidden)
+				cursor = clamp(cursor, 0, max(len(files)-1, 0))
+				if eerr != nil {
+					msg = fmt.tprintf("could not run $EDITOR: %v", eerr)
+				}
 			}
 		case 'h', 127:
+			// remember what we're leaving so the highlight lands on it, not on the top
+			leaving: [256]byte
+			n := copy(leaving[:], os.base(cwd))
 			if os.set_working_directory("..") == nil {
-				cursor, offset = 0, 0
-				files, cwd = load()
+				files, cwd = load(show_hidden)
+				cursor, offset = index_of(files, string(leaving[:n])), 0
 			}
 		case 'd':
 			if len(files) > 0 {
@@ -61,7 +84,7 @@ main :: proc() {
 					if err := os.remove(name); err != nil {
 						msg = fmt.tprintf("delete failed: %v", err)
 					} else {
-						files, cwd = load()
+						files, cwd = load(show_hidden)
 						cursor = clamp(cursor, 0, max(len(files)-1, 0))
 					}
 				}
@@ -69,12 +92,16 @@ main :: proc() {
 		case 'r':
 			if len(files) > 0 {
 				old := files[cursor].name
-				if name, ok := ask("rename to: ", old); ok && name != old {
+				if name, got := ask("rename to: ", old); got && name != old {
+					// rename(2) replaces the target without a word, so do the asking ourselves
+					if os.exists(name) && !confirm(fmt.tprintf("overwrite %s? (y/N) ", name)) {
+						break
+					}
 					if err := os.rename(old, name); err != nil {
 						msg = fmt.tprintf("rename failed: %v", err)
 					} else {
-						files, cwd = load()
-						cursor = clamp(cursor, 0, max(len(files)-1, 0))
+						files, cwd = load(show_hidden)
+						cursor = clamp(index_of(files, name), 0, max(len(files)-1, 0))
 					}
 				}
 			}
@@ -83,13 +110,65 @@ main :: proc() {
 }
 
 // ponytail: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
-load :: proc() -> (files: []os.File_Info, cwd: string) {
+load :: proc(show_hidden: bool) -> (files: []os.File_Info, cwd: string) {
 	free_all(context.temp_allocator)
 	cwd, _ = os.get_working_directory(context.temp_allocator)
-	// readdir order is whatever the fs feels like; sort or it looks broken
 	files, _ = os.read_all_directory_by_path(".", context.temp_allocator)
-	slice.sort_by(files, proc(a, b: os.File_Info) -> bool { return a.name < b.name })
+
+	if !show_hidden {
+		keep := make([dynamic]os.File_Info, 0, len(files), context.temp_allocator)
+		for f in files {
+			if len(f.name) > 0 && f.name[0] != '.' {
+				append(&keep, f)
+			}
+		}
+		files = keep[:]
+	}
+
+	// readdir order is whatever the fs feels like; sort or it looks broken
+	slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+		ad, bd := a.type == .Directory, b.type == .Directory
+		if ad != bd {
+			return ad
+		}
+		return a.name < b.name
+	})
 	return
+}
+
+index_of :: proc(files: []os.File_Info, name: string) -> int {
+	for f, i in files {
+		if f.name == name {
+			return i
+		}
+	}
+	return 0
+}
+
+// the editor wants a normal terminal and the whole screen, so give both back and take them again after
+open_in_editor :: proc(name: string, cooked, raw: ^posix.termios) -> (err: os.Error) {
+	editor := os.get_env("EDITOR", context.temp_allocator)
+	if editor == "" {
+		editor = "vi"
+	}
+
+	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, cooked)
+	fmt.print("\x1b[2J\x1b[H\x1b[?25h")
+
+	// nil on these handles means "close it", not "inherit it"
+	p, perr := os.process_start({
+		command = {editor, name},
+		stdin   = os.stdin,
+		stdout  = os.stdout,
+		stderr  = os.stderr,
+	})
+	if perr == nil {
+		_, _ = os.process_wait(p)
+	}
+
+	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, raw)
+	fmt.print("\x1b[?25l")
+	return perr
 }
 
 read_key :: proc() -> (key: byte, ok: bool) {
@@ -116,10 +195,11 @@ read_key :: proc() -> (key: byte, ok: bool) {
 
 // overwrites the bottom row in place, so prompts don't need the whole screen redrawn
 bar :: proc(text: string) {
-	fmt.printf("\x1b[%d;1H\x1b[2K\x1b[7m%s\x1b[0m", term_rows(), text)
+	rows, _ := term_size()
+	fmt.printf("\x1b[%d;1H\x1b[2K\x1b[7m%s\x1b[0m", rows, text)
 }
 
-// anything but y is no, because the y is the only key that deletes your file
+// anything but y is no, because y is the only key that deletes your file
 confirm :: proc(text: string) -> bool {
 	bar(text)
 	key, ok := read_key()
@@ -157,12 +237,27 @@ Winsize :: struct {
 }
 
 // core ships TIOCGWINSZ but no winsize struct, so it lives here
-term_rows :: proc() -> int {
+term_size :: proc() -> (rows: int, cols: int) {
 	ws: Winsize
 	if linux.ioctl(linux.Fd(posix.STDOUT_FILENO), linux.TIOCGWINSZ, uintptr(&ws)) != 0 || ws.row == 0 {
-		return 24 // ponytail: not a tty, assume the ancient default
+		return 24, 80 // ponytail: not a tty, assume the ancient default
 	}
-	return int(ws.row)
+	return int(ws.row), int(ws.col)
+}
+
+// ponytail: counts runes, not display columns, so CJK and emoji still overflow
+fit :: proc(s: string, width: int) -> string {
+	if width <= 0 {
+		return ""
+	}
+	n := 0
+	for _, i in s {
+		if n == width {
+			return s[:i]
+		}
+		n += 1
+	}
+	return s
 }
 
 perms :: proc(p: os.Permissions) -> (out: [9]byte) {
@@ -179,37 +274,40 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // ponytail: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows: int, msg: string) {
+draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int, msg: string) {
 	fmt.print("\x1b[2J\x1b[H")
-	fmt.printfln("\x1b[1m%s\x1b[0m", cwd)
+	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
 
 	if len(files) == 0 {
 		fmt.print("(empty or unreadable)")
 		return
 	}
 
-	// ponytail: names wider than the terminal wrap and throw the row count off, truncate when it annoys
 	for i in offset ..< min(offset+rows, len(files)) {
 		f := files[i]
 		slash := "/" if f.type == .Directory else ""
+		name := fit(f.name, cols-1) // -1 leaves room for the slash
 		if i == cursor {
-			fmt.printfln("\x1b[7m%s%s\x1b[0m", f.name, slash)
+			fmt.printfln("\x1b[7m%s%s\x1b[0m", name, slash)
 		} else {
-			fmt.printfln("%s%s", f.name, slash)
+			fmt.printfln("%s%s", name, slash)
 		}
 	}
 
 	// no trailing newline, printing one on the last row scrolls the whole screen up
 	if msg != "" {
-		fmt.printf("\x1b[7m %s \x1b[0m", msg)
+		fmt.printf("\x1b[7m %s \x1b[0m", fit(msg, cols-2))
 		return
 	}
 
 	f := files[cursor]
 	pp := perms(f.mode)
+	sbuf: [128]byte // bprintf writes into this, so the per-frame status costs no allocation
+	status: string
 	if f.type == .Directory {
-		fmt.printf("\x1b[7m %s  dir  %d/%d \x1b[0m", string(pp[:]), cursor+1, len(files))
+		status = fmt.bprintf(sbuf[:], " %s  dir  %d/%d ", string(pp[:]), cursor+1, len(files))
 	} else {
-		fmt.printf("\x1b[7m %s  %M  %d/%d \x1b[0m", string(pp[:]), f.size, cursor+1, len(files))
+		status = fmt.bprintf(sbuf[:], " %s  %M  %d/%d ", string(pp[:]), f.size, cursor+1, len(files))
 	}
+	fmt.printf("\x1b[7m%s\x1b[0m", fit(status, cols))
 }
