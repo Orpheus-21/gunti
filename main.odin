@@ -65,7 +65,7 @@ main :: proc() {
 			if len(files) > 0 {
 				// try to walk in first: chdir fails on a regular file, and symlinked dirs work free
 				eerr: os.Error
-				// ponytail: a dir we lack permission to enter also lands here and gets handed to the editor
+				// shortcut: a dir we lack permission to enter also lands here and gets handed to the editor
 				if os.set_working_directory(files[cursor].name) == nil {
 					cursor, offset = 0, 0
 				} else {
@@ -184,7 +184,7 @@ main :: proc() {
 
 				err: os.Error
 				if is_dir {
-					// ponytail: one level only, make_directory_all if nested paths ever get typed
+					// shortcut: one level only, make_directory_all if nested paths ever get typed
 					err = os.make_directory(name)
 				} else {
 					err = create_file(name)
@@ -218,7 +218,7 @@ main :: proc() {
 }
 
 // case-insensitive substring match, wrapping past the end so the last hit leads back to the first
-// ponytail: lowercases into the temp arena, which only load() frees, so a long search spree holds memory
+// shortcut: lowercases into the temp arena, which only load() frees, so a long search spree holds memory
 find :: proc(files: []os.File_Info, query: string, start: int) -> (int, bool) {
 	if len(files) == 0 || query == "" {
 		return 0, false
@@ -288,7 +288,7 @@ join_path :: proc(buf: []byte, dir, name: string) -> int {
 }
 
 // true if path is root itself or sits somewhere beneath it
-// ponytail: textual compare, so a symlink pointing back inside root still slips through
+// shortcut: textual compare, so a symlink pointing back inside root still slips through
 under :: proc(path, root: string) -> bool {
 	if len(path) < len(root) || path[:len(root)] != root {
 		return false
@@ -313,7 +313,7 @@ test_paste_guards :: proc(t: ^testing.T) {
 	testing.expect(t, !under("/a", "/a/b"), "a parent is not under its child")
 }
 
-// ponytail: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
+// shortcut: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
 load :: proc(show_hidden: bool) -> (files: []os.File_Info, cwd: string) {
 	free_all(context.temp_allocator)
 	cwd, _ = os.get_working_directory(context.temp_allocator)
@@ -383,7 +383,7 @@ read_key :: proc() -> (key: byte, ok: bool) {
 
 	key = buf[0]
 	// arrows arrive as esc [ A/B/C/D; fold them onto hjkl so movement lives in one place
-	// ponytail: a lone esc blocks here until two more keys arrive, nobody presses esc yet
+	// shortcut: a lone esc blocks here until two more keys arrive, nobody presses esc yet
 	if key == 0x1b {
 		if n, _ := os.read(os.stdin, buf[1:3]); n == 2 && buf[1] == '[' {
 			switch buf[2] {
@@ -410,7 +410,7 @@ confirm :: proc(text: string) -> bool {
 	return ok && key == 'y'
 }
 
-// ponytail: no left/right editing in here, and arrows insert hjkl. it's a filename, not an essay.
+// shortcut: no left/right editing in here, and arrows insert hjkl. it's a filename, not an essay.
 ask :: proc(label, initial: string) -> (answer: string, ok: bool) {
 	buf := make([dynamic]byte, 0, 64, context.temp_allocator)
 	append(&buf, initial)
@@ -444,12 +444,12 @@ Winsize :: struct {
 term_size :: proc() -> (rows: int, cols: int) {
 	ws: Winsize
 	if linux.ioctl(linux.Fd(posix.STDOUT_FILENO), linux.TIOCGWINSZ, uintptr(&ws)) != 0 || ws.row == 0 {
-		return 24, 80 // ponytail: not a tty, assume the ancient default
+		return 24, 80 // shortcut: not a tty, assume the ancient default
 	}
 	return int(ws.row), int(ws.col)
 }
 
-// ponytail: counts runes, not display columns, so CJK and emoji still overflow
+// shortcut: counts runes, not display columns, so CJK and emoji still overflow
 fit :: proc(s: string, width: int) -> string {
 	if width <= 0 {
 		return ""
@@ -477,7 +477,7 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 	return
 }
 
-// ponytail: full redraw per keypress, diff the rows if it ever feels slow
+// shortcut: full redraw per keypress, diff the rows if it ever feels slow
 draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int, msg: string) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
