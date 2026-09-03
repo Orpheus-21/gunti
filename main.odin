@@ -5,6 +5,7 @@ import "core:os"
 import "core:slice"
 import "core:sys/linux"
 import "core:sys/posix"
+import "core:testing"
 
 main :: proc() {
 	cooked: posix.termios
@@ -23,6 +24,10 @@ main :: proc() {
 	cursor, offset := 0, 0
 	show_hidden := false
 	msg: string
+	// the clipboard has to outlive load(), which frees the arena entry names live in
+	clip: [4096]byte
+	clip_n := 0
+	clip_cut := false
 	files, cwd := load(show_hidden)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
@@ -105,8 +110,102 @@ main :: proc() {
 					}
 				}
 			}
+		case 'y', 'x':
+			if len(files) > 0 {
+				name := files[cursor].name
+				clip_n = join_path(clip[:], cwd, name)
+				clip_cut = key == 'x'
+				if clip_n == 0 {
+					msg = "path too long to hold"
+				} else {
+					msg = fmt.tprintf("%s %s", "cut" if clip_cut else "yanked", name)
+				}
+			}
+		case 'p':
+			if clip_n > 0 {
+				src := string(clip[:clip_n])
+				// paste lands in the directory we're standing in, under the same name
+				name := os.base(src)
+				dbuf: [4096]byte
+				dn := join_path(dbuf[:], cwd, name)
+				if dn == 0 {
+					msg = "path too long to paste"
+					break
+				}
+				if string(dbuf[:dn]) == src {
+					// copy_file opens dst with O_TRUNC while src is still open, and empties it
+					msg = "source and destination are the same"
+					break
+				}
+				if os.is_directory(src) && under(cwd, src) {
+					// the copy would walk into the copy it is making, until the path runs out
+					msg = "cannot paste a directory into itself"
+					break
+				}
+				// rename and copy_file both clobber the target silently, so do the asking ourselves
+				if os.exists(name) && !confirm(fmt.tprintf("overwrite %s? (y/N) ", name)) {
+					break
+				}
+				err: os.Error
+				switch {
+				case clip_cut:
+					// moves files and directories alike, but only within one filesystem
+					err = os.rename(src, name)
+				case os.is_directory(src):
+					err = os.copy_directory_all(name, src)
+				case:
+					// dst first, src second: backwards from cp(1) and from os.rename above
+					err = os.copy_file(name, src)
+				}
+				if err == nil && clip_cut {
+					clip_n = 0 // the source moved, so the clipboard points at nothing
+				}
+				files, cwd = load(show_hidden)
+				cursor = clamp(index_of(files, name), 0, max(len(files)-1, 0))
+				if err != nil {
+					msg = fmt.tprintf("paste failed: %v", err)
+				}
+			}
 		}
 	}
+}
+
+// a plain buffer, not the temp allocator, so the result survives the next load()
+join_path :: proc(buf: []byte, dir, name: string) -> int {
+	sep := "/" if dir != "/" else ""
+	if len(dir)+len(sep)+len(name) > len(buf) {
+		return 0
+	}
+	n := copy(buf[:], dir)
+	n += copy(buf[n:], sep)
+	n += copy(buf[n:], name)
+	return n
+}
+
+// true if path is root itself or sits somewhere beneath it
+// ponytail: textual compare, so a symlink pointing back inside root still slips through
+under :: proc(path, root: string) -> bool {
+	if len(path) < len(root) || path[:len(root)] != root {
+		return false
+	}
+	rest := path[len(root):]
+	return rest == "" || rest[0] == '/' || root == "/"
+}
+
+@(test)
+test_paste_guards :: proc(t: ^testing.T) {
+	buf: [64]byte
+	n := join_path(buf[:], "/home/x", "a.txt")
+	testing.expect(t, string(buf[:n]) == "/home/x/a.txt")
+	n = join_path(buf[:], "/", "a.txt")
+	testing.expect(t, string(buf[:n]) == "/a.txt", "root must not produce //a.txt")
+	testing.expect(t, join_path(buf[:4], "/home/x", "a.txt") == 0, "overlong path must refuse")
+
+	testing.expect(t, under("/a/b", "/a/b"), "a dir is under itself")
+	testing.expect(t, under("/a/b/c", "/a/b"), "a child is under its parent")
+	testing.expect(t, under("/a/b", "/"), "everything is under root")
+	testing.expect(t, !under("/a/bc", "/a/b"), "a name sharing a prefix is not a child")
+	testing.expect(t, !under("/a", "/a/b"), "a parent is not under its child")
 }
 
 // ponytail: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
