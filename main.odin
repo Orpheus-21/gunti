@@ -1,5 +1,6 @@
 package gunti
 
+import "core:bufio"
 import "core:fmt"
 import "core:os"
 import "core:slice"
@@ -1471,16 +1472,33 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // shortcut: full redraw per keypress, diff the rows if it ever feels slow
+// one buffer for the whole frame, reused every call: draw runs on every keypress
+// and must not allocate. if it ever fills, bufio flushes early on its own, which
+// costs an extra write and nothing else.
+@(private = "file")
+frame_buf: [64 * 1024]byte
+
+// the frame goes out in a single write, and the screen is never cleared first:
+// clearing then repainting shows a blank flash on a real terminal. instead each
+// line erases its own tail, and one erase-to-bottom at the end removes whatever
+// a previously longer listing left behind.
 draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
-	fmt.print("\x1b[2J\x1b[H")
-	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
+	b: bufio.Writer
+	bufio.writer_init_with_buf(&b, os.to_stream(os.stdout), frame_buf[:])
+	w := bufio.writer_to_writer(&b)
+	defer bufio.writer_flush(&b)
+
+	// home, not clear
+	fmt.wprint(w, "\x1b[H", flush = false)
+	fmt.wprintfln(w, "\x1b[1m%s\x1b[0m\x1b[K", fit(cwd, cols), flush = false)
 
 	if len(files) == 0 {
-		fmt.print("(empty or unreadable)")
+		fmt.wprint(w, "(empty or unreadable)\x1b[K", flush = false)
 		// an empty listing is exactly when you need to be told why, so say it here too
 		if msg != "" {
-			fmt.printf("\n\x1b[7m %s \x1b[0m", fit(msg, cols-2))
+			fmt.wprintf(w, "\n\x1b[7m %s \x1b[0m\x1b[K", fit(msg, cols-2), flush = false)
 		}
+		fmt.wprint(w, "\x1b[J", flush = false)
 		return
 	}
 
@@ -1512,15 +1530,15 @@ draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows
 
 		line := row_text(row[:], mark, f.name, tail, right, cols)
 		if i == cursor {
-			fmt.printfln("\x1b[7m%s\x1b[0m", line)
+			fmt.wprintfln(w, "\x1b[7m%s\x1b[0m\x1b[K", line, flush = false)
 		} else {
-			fmt.printfln("%s", line)
+			fmt.wprintfln(w, "%s\x1b[K", line, flush = false)
 		}
 	}
 
 	// no trailing newline, printing one on the last row scrolls the whole screen up
 	if msg != "" {
-		fmt.printf("\x1b[7m %s \x1b[0m", fit(msg, cols-2))
+		fmt.wprintf(w, "\x1b[7m %s \x1b[0m\x1b[K\x1b[J", fit(msg, cols-2), flush = false)
 		return
 	}
 
@@ -1533,5 +1551,5 @@ draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows
 	} else {
 		status = fmt.bprintf(sbuf[:], " %s  %M  %d/%d  %v ", string(pp[:]), f.size, cursor+1, len(files), sort_by)
 	}
-	fmt.printf("\x1b[7m%s\x1b[0m", fit(status, cols))
+	fmt.wprintf(w, "\x1b[7m%s\x1b[0m\x1b[K\x1b[J", fit(status, cols), flush = false)
 }
