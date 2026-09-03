@@ -200,6 +200,8 @@ main :: proc() {
 					msg = fmt.tprintf("create failed: %v", err)
 				}
 			}
+		case '?':
+			help()
 		case '/', 'n':
 			// n is the same jump with the previous query, so they share everything below
 			if key == '/' {
@@ -220,6 +222,42 @@ main :: proc() {
 			}
 		}
 	}
+}
+
+// kept next to nothing else on purpose: this is the only place the key list is written down
+HELP := [?]string{
+	"GUNTI",
+	"",
+	"  j  down            k  up",
+	"  g  top             G  bottom",
+	"  h  parent dir      l  enter dir, or open file in $EDITOR",
+	"",
+	"  /  search          n  next match",
+	"  s  cycle sort: name / size / time",
+	"  .  show or hide dotfiles",
+	"",
+	"  a  create, end the name with / for a directory",
+	"  r  rename          d  delete",
+	"  y  copy            x  cut            p  paste",
+	"",
+	"  ?  this help       q  quit",
+	"",
+	"  arrows work as hjkl, backspace as h, enter as l",
+}
+
+// any key returns, so there is nothing to learn to get back out
+help :: proc() {
+	rows, cols := term_size()
+	fmt.print("\x1b[2J\x1b[H")
+	for line, i in HELP {
+		if i >= rows-1 {
+			break
+		}
+		fmt.println(fit(line, cols))
+	}
+	// no trailing newline on the last row, same reason as draw()
+	fmt.printf("\x1b[7m%s\x1b[0m", fit(" press any key ", cols))
+	read_key()
 }
 
 // case-insensitive substring match, wrapping past the end so the last hit leads back to the first
