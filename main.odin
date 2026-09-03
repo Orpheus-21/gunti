@@ -93,7 +93,7 @@ main :: proc() {
 
 	all, view, files, selected, cwd := read_dir(show_hidden, sort_by)
 	msg = string(problem[:problem_n])
-	for {
+	browsing: for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
@@ -119,7 +119,7 @@ main :: proc() {
 
 		switch key {
 		case 'q', 3:
-			return
+			break browsing
 		case 'j':
 			cursor = min(cursor+1, len(files)-1)
 		case 'k':
@@ -363,6 +363,14 @@ main :: proc() {
 				msg = fmt.tprintf("not found: %s", string(query[:query_n]))
 			}
 		}
+	}
+
+	// no process can change its parent's directory, so the most a file manager
+	// can do is report where it ended up and let a shell wrapper act on it.
+	// inert unless GUNTI_CD names a file, which nothing sets by default.
+	if path := os.get_env("GUNTI_CD", context.temp_allocator); path != "" {
+		// nothing useful to do if this fails: we are on our way out
+		_ = os.write_entire_file(path, cwd)
 	}
 }
 
