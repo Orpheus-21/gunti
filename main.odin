@@ -77,6 +77,8 @@ main :: proc() {
 	// that parse_config wrote it into.
 	problem: [256]byte
 	problem_n := 0
+	// defaults first: binding_for takes the last match, so the user's config wins
+	parse_config(DEFAULT_CONFIG, &cfg)
 	if text, err := os.read_entire_file(config_path(context.temp_allocator), context.temp_allocator); err == nil {
 		problem_n = copy(problem[:], parse_config(string(text), &cfg))
 	}
@@ -339,10 +341,6 @@ main :: proc() {
 					msg = fmt.tprintf("could not run sh: %v", err)
 				}
 			}
-		case 'v':
-			if len(files) > 0 && files[cursor].type != .Directory {
-				preview(files[cursor].name)
-			}
 		case '?':
 			help()
 		case '/', 'n', 'N':
@@ -391,7 +389,7 @@ HELP := [?]string{
 	"  s  cycle sort: name / size / time",
 	"  .  show or hide dotfiles",
 	"",
-	"  v  peek inside a file",
+	"  v  peek inside a file, via your pager (a default binding, rebindable)",
 	"  !  run a shell command: \"$@\" ticked files, $f current, $d dir",
 	"  space  tick a file; d, y and x then act on every ticked one",
 	"  a  create, end the name with / for a directory",
@@ -406,58 +404,6 @@ HELP := [?]string{
 	"  ~/.config/gunti/config:  set sort name|size|time,  set hidden true|false",
 	"                          map <key> <command>,  ! prefix = show output",
 	"                          in commands: \"$@\" = the files to act on",
-}
-
-// enough for any sane terminal, and it means previewing a 4GB log reads 32KB of it
-PREVIEW_BYTES :: 32 * 1024
-
-// a NUL byte means it is not text, and dumping it raw would garble the terminal
-is_binary :: proc(data: []byte) -> bool {
-	return slice.contains(data, 0)
-}
-
-@(test)
-test_is_binary :: proc(t: ^testing.T) {
-	testing.expect(t, !is_binary(transmute([]byte)string("hello\nworld")), "plain text is not binary")
-	testing.expect(t, is_binary([]byte{'a', 0, 'b'}), "an embedded NUL means binary")
-	testing.expect(t, !is_binary([]byte{}), "an empty file is not binary")
-}
-
-// any key returns, same as help
-preview :: proc(name: string) {
-	rows, cols := term_size()
-	fmt.print("\x1b[2J\x1b[H")
-	fmt.printfln("\x1b[1m%s\x1b[0m", fit(name, cols))
-
-	buf: [PREVIEW_BYTES]byte
-	n: int
-	if f, err := os.open(name); err != nil {
-		fmt.printf("cannot read: %v", err)
-	} else {
-		defer os.close(f)
-		n, _ = os.read(f, buf[:])
-		data := buf[:n]
-		switch {
-		case n == 0:
-			fmt.print("(empty)")
-		case is_binary(data):
-			fmt.print("(binary)")
-		case:
-			// rows-2 leaves the header and the footer their own lines
-			printed := 0
-			text := string(data)
-			for line in strings.split_lines_iterator(&text) {
-				if printed >= rows-2 {
-					break
-				}
-				fmt.println(fit(line, cols))
-				printed += 1
-			}
-		}
-	}
-
-	bar(" press any key ")
-	read_key()
 }
 
 // any key returns, so there is nothing to learn to get back out
@@ -611,6 +557,14 @@ config_path :: proc(allocator: runtime.Allocator) -> string {
 	}
 	return fmt.tprintf("%s/.config/gunti/config", os.get_env("HOME", allocator))
 }
+
+// parsed before the user's config, so any line here can be overridden by one.
+// this is the only place a default binding lives, and it is data, not code.
+// previewing belongs out here: a pager already handles binary files, huge files
+// and every encoding, which the 60 lines this replaced only approximated.
+DEFAULT_CONFIG :: `
+map v !${PAGER:-less} -- "$f"
+`
 
 Binding :: struct {
 	key:         byte,
