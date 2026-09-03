@@ -24,6 +24,7 @@ main :: proc() {
 
 	cursor, offset := 0, 0
 	show_hidden := false
+	sort_by := Sort.Name
 	msg: string
 	// the clipboard has to outlive load(), which frees the arena entry names live in
 	clip: [4096]byte
@@ -32,13 +33,13 @@ main :: proc() {
 	// the query outlives the arena ask() used, so n can repeat it later
 	query: [256]byte
 	query_n := 0
-	files, cwd := load(show_hidden)
+	files, cwd := load(show_hidden, sort_by)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, cursor, offset, rows, cols, msg)
+		draw(cwd, files, cursor, offset, rows, cols, msg, sort_by)
 
 		key, ok := read_key()
 		if !ok {
@@ -57,10 +58,14 @@ main :: proc() {
 			cursor = 0
 		case 'G':
 			cursor = max(len(files)-1, 0)
+		case 's':
+			sort_by = Sort((int(sort_by) + 1) % len(Sort))
+			cursor, offset = 0, 0
+			files, cwd = load(show_hidden, sort_by)
 		case '.':
 			show_hidden = !show_hidden
 			cursor, offset = 0, 0
-			files, cwd = load(show_hidden)
+			files, cwd = load(show_hidden, sort_by)
 		case 'l', '\r', '\n':
 			if len(files) > 0 {
 				// try to walk in first: chdir fails on a regular file, and symlinked dirs work free
@@ -71,7 +76,7 @@ main :: proc() {
 				} else {
 					eerr = open_in_editor(files[cursor].name, &cooked, &raw)
 				}
-				files, cwd = load(show_hidden)
+				files, cwd = load(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
 				if eerr != nil {
 					msg = fmt.tprintf("could not run $EDITOR: %v", eerr)
@@ -82,7 +87,7 @@ main :: proc() {
 			leaving: [256]byte
 			n := copy(leaving[:], os.base(cwd))
 			if os.set_working_directory("..") == nil {
-				files, cwd = load(show_hidden)
+				files, cwd = load(show_hidden, sort_by)
 				cursor, offset = index_of(files, string(leaving[:n])), 0
 			}
 		case 'd':
@@ -93,7 +98,7 @@ main :: proc() {
 					if err := os.remove(name); err != nil {
 						msg = fmt.tprintf("delete failed: %v", err)
 					} else {
-						files, cwd = load(show_hidden)
+						files, cwd = load(show_hidden, sort_by)
 						cursor = clamp(cursor, 0, max(len(files)-1, 0))
 					}
 				}
@@ -112,7 +117,7 @@ main :: proc() {
 					if err := os.rename(old, name); err != nil {
 						msg = fmt.tprintf("rename failed: %v", err)
 					} else {
-						files, cwd = load(show_hidden)
+						files, cwd = load(show_hidden, sort_by)
 						cursor = clamp(index_of(files, string(renamed[:rn])), 0, max(len(files)-1, 0))
 					}
 				}
@@ -167,7 +172,7 @@ main :: proc() {
 				if err == nil && clip_cut {
 					clip_n = 0 // the source moved, so the clipboard points at nothing
 				}
-				files, cwd = load(show_hidden)
+				files, cwd = load(show_hidden, sort_by)
 				cursor = clamp(index_of(files, name), 0, max(len(files)-1, 0))
 				if err != nil {
 					msg = fmt.tprintf("paste failed: %v", err)
@@ -189,7 +194,7 @@ main :: proc() {
 				} else {
 					err = create_file(name)
 				}
-				files, cwd = load(show_hidden)
+				files, cwd = load(show_hidden, sort_by)
 				cursor = clamp(index_of(files, string(made[:mn])), 0, max(len(files)-1, 0))
 				if err != nil {
 					msg = fmt.tprintf("create failed: %v", err)
@@ -314,7 +319,7 @@ test_paste_guards :: proc(t: ^testing.T) {
 }
 
 // shortcut: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
-load :: proc(show_hidden: bool) -> (files: []os.File_Info, cwd: string) {
+load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: string) {
 	free_all(context.temp_allocator)
 	cwd, _ = os.get_working_directory(context.temp_allocator)
 	files, _ = os.read_all_directory_by_path(".", context.temp_allocator)
@@ -329,15 +334,62 @@ load :: proc(show_hidden: bool) -> (files: []os.File_Info, cwd: string) {
 		files = keep[:]
 	}
 
-	// readdir order is whatever the fs feels like; sort or it looks broken
-	slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
-		ad, bd := a.type == .Directory, b.type == .Directory
-		if ad != bd {
-			return ad
-		}
-		return a.name < b.name
-	})
+	sort_files(files, sort_by)
 	return
+}
+
+Sort :: enum {
+	Name,
+	Size,
+	Time,
+}
+
+// readdir order is whatever the fs feels like; sort or it looks broken.
+// slice.sort_by takes a plain proc with no captured state, so each mode gets its own.
+sort_files :: proc(files: []os.File_Info, mode: Sort) {
+	switch mode {
+	case .Name:
+		slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+			if ad, bd := a.type == .Directory, b.type == .Directory; ad != bd {
+				return ad
+			}
+			return a.name < b.name
+		})
+	case .Size:
+		slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+			if ad, bd := a.type == .Directory, b.type == .Directory; ad != bd {
+				return ad
+			}
+			// biggest first, since that is the reason to sort by size at all
+			return a.size > b.size
+		})
+	case .Time:
+		slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+			if ad, bd := a.type == .Directory, b.type == .Directory; ad != bd {
+				return ad
+			}
+			// newest first, for "what did I just touch"
+			return a.modification_time._nsec > b.modification_time._nsec
+		})
+	}
+}
+
+@(test)
+test_sort_files :: proc(t: ^testing.T) {
+	files := []os.File_Info{
+		{name = "b.txt", size = 10, type = .Regular},
+		{name = "dir", type = .Directory},
+		{name = "a.txt", size = 30, type = .Regular},
+	}
+
+	sort_files(files, .Name)
+	testing.expect(t, files[0].name == "dir", "directories sort first by name")
+	testing.expect(t, files[1].name == "a.txt", "then names ascend")
+
+	sort_files(files, .Size)
+	testing.expect(t, files[0].name == "dir", "directories still sort first by size")
+	testing.expect(t, files[1].name == "a.txt", "biggest file first")
+	testing.expect(t, files[2].name == "b.txt", "smallest file last")
 }
 
 index_of :: proc(files: []os.File_Info, name: string) -> int {
@@ -478,7 +530,7 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // shortcut: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int, msg: string) {
+draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int, msg: string, sort_by: Sort) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
 
@@ -509,9 +561,9 @@ draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int
 	sbuf: [128]byte // bprintf writes into this, so the per-frame status costs no allocation
 	status: string
 	if f.type == .Directory {
-		status = fmt.bprintf(sbuf[:], " %s  dir  %d/%d ", string(pp[:]), cursor+1, len(files))
+		status = fmt.bprintf(sbuf[:], " %s  dir  %d/%d  %v ", string(pp[:]), cursor+1, len(files), sort_by)
 	} else {
-		status = fmt.bprintf(sbuf[:], " %s  %M  %d/%d ", string(pp[:]), f.size, cursor+1, len(files))
+		status = fmt.bprintf(sbuf[:], " %s  %M  %d/%d  %v ", string(pp[:]), f.size, cursor+1, len(files), sort_by)
 	}
 	fmt.printf("\x1b[7m%s\x1b[0m", fit(status, cols))
 }
