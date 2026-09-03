@@ -213,6 +213,16 @@ main :: proc() {
 					msg = fmt.tprintf("create failed: %v", err)
 				}
 			}
+		case 'c':
+			if path, got := ask("go to: ", ""); got {
+				target := expand_home(path, os.get_env("HOME", context.temp_allocator))
+				if err := os.set_working_directory(target); err != nil {
+					msg = fmt.tprintf("cannot go there: %v", err)
+				} else {
+					cursor, offset = 0, 0
+					files, cwd, selected = load(show_hidden, sort_by)
+				}
+			}
 		case 'v':
 			if len(files) > 0 && files[cursor].type != .Directory {
 				preview(files[cursor].name)
@@ -248,6 +258,7 @@ HELP := [?]string{
 	"  j  down            k  up",
 	"  g  top             G  bottom",
 	"  h  parent dir      l  enter dir, or open file in $EDITOR",
+	"  c  go to a path, ~ included",
 	"",
 	"  /  search          n  next match",
 	"  s  cycle sort: name / size / time",
@@ -387,6 +398,28 @@ test_create_file_never_clobbers :: proc(t: ^testing.T) {
 	testing.expect_value(t, create_file(path), nil)
 	// an error here means the file was never opened, so nothing could have been truncated
 	testing.expect(t, create_file(path) != nil, "creating over an existing file must fail")
+}
+
+// ~ alone or a leading ~/ means home; everything else is passed through untouched.
+// home is a parameter so this can be checked without depending on the machine it runs on.
+expand_home :: proc(path, home: string) -> string {
+	if path == "~" {
+		return home
+	}
+	if strings.has_prefix(path, "~/") {
+		return fmt.tprintf("%s%s", home, path[1:])
+	}
+	return path
+}
+
+@(test)
+test_expand_home :: proc(t: ^testing.T) {
+	testing.expect(t, expand_home("~", "/home/x") == "/home/x", "~ alone is home")
+	testing.expect(t, expand_home("~/Work", "/home/x") == "/home/x/Work", "~/ prefixes home")
+	testing.expect(t, expand_home("/etc", "/home/x") == "/etc", "absolute paths pass through")
+	testing.expect(t, expand_home("sub", "/home/x") == "sub", "relative paths pass through")
+	testing.expect(t, expand_home("~xyz", "/home/x") == "~xyz", "only ~ alone or ~/ expands")
+	testing.expect(t, expand_home("", "/home/x") == "", "empty stays empty")
 }
 
 // the ticked entries, or just the highlighted one when nothing is ticked
