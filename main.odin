@@ -43,13 +43,13 @@ main :: proc() {
 	// the query outlives the arena ask() used, so n can repeat it later
 	query: [256]byte
 	query_n := 0
-	files, cwd, selected, links := load(show_hidden, sort_by)
+	all, view, files, selected, cwd := read_dir(show_hidden, sort_by)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, selected, links, cursor, offset, rows, cols, msg, sort_by, local)
+		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by, local)
 
 		key, ok := read_key()
 		if !ok {
@@ -77,11 +77,13 @@ main :: proc() {
 		case 's':
 			sort_by = Sort((int(sort_by) + 1) % len(Sort))
 			cursor, offset = 0, 0
-			files, cwd, selected, links = load(show_hidden, sort_by)
+			// the entries are already in memory; only the order changed
+			files = refilter(all, view, selected, show_hidden, sort_by)
 		case '.':
 			show_hidden = !show_hidden
 			cursor, offset = 0, 0
-			files, cwd, selected, links = load(show_hidden, sort_by)
+			// read_dir already fetched the dotfiles, so this is just a re-filter
+			files = refilter(all, view, selected, show_hidden, sort_by)
 		case 'l', '\r', '\n':
 			if len(files) > 0 {
 				// try to walk in first: chdir fails on a regular file, and symlinked dirs work free
@@ -92,7 +94,7 @@ main :: proc() {
 				} else {
 					eerr = open_in_editor(files[cursor].name, &cooked, &raw)
 				}
-				files, cwd, selected, links = load(show_hidden, sort_by)
+				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
 				if eerr != nil {
 					msg = fmt.tprintf("could not run $EDITOR: %v", eerr)
@@ -103,7 +105,7 @@ main :: proc() {
 			leaving: [256]byte
 			n := copy(leaving[:], os.base(cwd))
 			if os.set_working_directory("..") == nil {
-				files, cwd, selected, links = load(show_hidden, sort_by)
+				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor, offset = index_of(files, string(leaving[:n])), 0
 			}
 		case 'd':
@@ -118,7 +120,7 @@ main :: proc() {
 						}
 					}
 					total := len(victims)
-					files, cwd, selected, links = load(show_hidden, sort_by)
+					all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 					cursor = clamp(cursor, 0, max(len(files)-1, 0))
 					if failed > 0 {
 						msg = fmt.tprintf("%d of %d could not be deleted", failed, total)
@@ -139,7 +141,7 @@ main :: proc() {
 					if err := os.rename(old, name); err != nil {
 						msg = fmt.tprintf("rename failed: %v", err)
 					} else {
-						files, cwd, selected, links = load(show_hidden, sort_by)
+						all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 						cursor = clamp(index_of(files, string(renamed[:rn])), 0, max(len(files)-1, 0))
 					}
 				}
@@ -192,7 +194,7 @@ main :: proc() {
 				if pn == 0 && clip_cut {
 					clip_n = 0
 				}
-				files, cwd, selected, links = load(show_hidden, sort_by)
+				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(index_of(files, string(last[:ln])), 0, max(len(files)-1, 0))
 				if pn > 0 {
 					msg = fmt.tprintf("%s", string(problem[:pn]))
@@ -216,7 +218,7 @@ main :: proc() {
 				} else {
 					err = create_file(name)
 				}
-				files, cwd, selected, links = load(show_hidden, sort_by)
+				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(index_of(files, string(made[:mn])), 0, max(len(files)-1, 0))
 				if err != nil {
 					msg = fmt.tprintf("create failed: %v", err)
@@ -229,7 +231,7 @@ main :: proc() {
 			if len(files) > 0 {
 				kn = copy(keep[:], files[cursor].name)
 			}
-			files, cwd, selected, links = load(show_hidden, sort_by)
+			all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 			cursor = clamp(index_of(files, string(keep[:kn])), 0, max(len(files)-1, 0))
 		case 'c':
 			if path, got := ask("go to: ", ""); got {
@@ -238,7 +240,7 @@ main :: proc() {
 					msg = fmt.tprintf("cannot go there: %v", err)
 				} else {
 					cursor, offset = 0, 0
-					files, cwd, selected, links = load(show_hidden, sort_by)
+					all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				}
 			}
 		case 'v':
@@ -363,7 +365,7 @@ help :: proc() {
 
 // case-insensitive substring match, wrapping past the end so the last hit leads back to the first
 // shortcut: lowercases into the temp arena, which only load() frees, so a long search spree holds memory
-find :: proc(files: []os.File_Info, query: string, start: int) -> (int, bool) {
+find :: proc(files: []Entry, query: string, start: int) -> (int, bool) {
 	if len(files) == 0 || query == "" {
 		return 0, false
 	}
@@ -380,7 +382,7 @@ find :: proc(files: []os.File_Info, query: string, start: int) -> (int, bool) {
 
 @(test)
 test_find :: proc(t: ^testing.T) {
-	files := []os.File_Info{{name = "alpha.txt"}, {name = "README"}, {name = "notes.md"}}
+	files := []Entry{{info = {name = "alpha.txt"}}, {info = {name = "README"}}, {info = {name = "notes.md"}}}
 
 	i, ok := find(files, "readme", 0)
 	testing.expect(t, ok && i == 1, "must match regardless of case")
@@ -442,8 +444,8 @@ test_expand_home :: proc(t: ^testing.T) {
 }
 
 // the ticked entries, or just the highlighted one when nothing is ticked
-targets :: proc(files: []os.File_Info, selected: []bool, cursor: int) -> []os.File_Info {
-	out := make([dynamic]os.File_Info, 0, len(files), context.temp_allocator)
+targets :: proc(files: []Entry, selected: []bool, cursor: int) -> []Entry {
+	out := make([dynamic]Entry, 0, len(files), context.temp_allocator)
 	for f, i in files {
 		if selected[i] {
 			append(&out, f)
@@ -456,7 +458,7 @@ targets :: proc(files: []os.File_Info, selected: []bool, cursor: int) -> []os.Fi
 }
 
 // a name reads better than "1 items" when only one thing is going to happen
-describe :: proc(files: []os.File_Info) -> string {
+describe :: proc(files: []Entry) -> string {
 	if len(files) == 1 {
 		return files[0].name
 	}
@@ -503,7 +505,7 @@ paste_one :: proc(src, cwd: string, cut: bool) -> (name: string, why: string) {
 
 @(test)
 test_targets :: proc(t: ^testing.T) {
-	files := []os.File_Info{{name = "a"}, {name = "b"}, {name = "c"}}
+	files := []Entry{{info = {name = "a"}}, {info = {name = "b"}}, {info = {name = "c"}}}
 
 	got := targets(files, []bool{false, false, false}, 1)
 	testing.expect(t, len(got) == 1 && got[0].name == "b", "no ticks means act on the highlighted entry")
@@ -553,44 +555,66 @@ test_paste_guards :: proc(t: ^testing.T) {
 	testing.expect(t, !under("/a", "/a/b"), "a parent is not under its child")
 }
 
-// shortcut: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
-load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: string, selected: []bool, links: []string) {
+Entry :: struct {
+	using info: os.File_Info,
+	link:       string, // "" unless this is a symlink
+}
+
+// the only proc here that touches the disk. it reads everything, hidden files
+// included, so that changing the view afterwards never needs the disk again.
+read_dir :: proc(show_hidden: bool, sort_by: Sort) -> (all, view, files: []Entry, selected: []bool, cwd: string) {
 	free_all(context.temp_allocator)
 	cwd, _ = os.get_working_directory(context.temp_allocator)
-	files, _ = os.read_all_directory_by_path(".", context.temp_allocator)
+	infos, _ := os.read_all_directory_by_path(".", context.temp_allocator)
 
-	if !show_hidden {
-		keep := make([dynamic]os.File_Info, 0, len(files), context.temp_allocator)
-		for f in files {
-			if len(f.name) > 0 && f.name[0] != '.' {
-				append(&keep, f)
-			}
+	all = make([]Entry, len(infos), context.temp_allocator)
+	for info, i in infos {
+		all[i] = Entry {
+			info = info,
 		}
-		files = keep[:]
-	}
-
-	sort_files(files, sort_by)
-	// tied to the listing it belongs to, so navigating or re-sorting drops the ticks
-	selected = make([]bool, len(files), context.temp_allocator)
-
-	// resolved here, not in draw: reading a link hits the disk and allocates, and
-	// draw runs on every single keypress. "" means the entry is not a link.
-	links = make([]string, len(files), context.temp_allocator)
-	for f, i in files {
-		if f.type != .Symlink {
+		if info.type != .Symlink {
 			continue
 		}
-		target, err := os.read_link(f.name, context.temp_allocator)
-		if err != nil {
-			links[i] = " -> ?"
-		} else if os.exists(f.name) {
+		// resolved here rather than in draw: this costs a disk read per link
+		target, err := os.read_link(info.name, context.temp_allocator)
+		switch {
+		case err != nil:
+			all[i].link = " -> ?"
+		case os.exists(info.name):
 			// exists() follows the link, so a false here means it points at nothing
-			links[i] = fmt.tprintf(" -> %s", target)
-		} else {
-			links[i] = fmt.tprintf(" -> %s (broken)", target)
+			all[i].link = fmt.tprintf(" -> %s", target)
+		case:
+			all[i].link = fmt.tprintf(" -> %s (broken)", target)
 		}
 	}
+
+	// sized once for the whole listing and reused, so re-sorting allocates nothing
+	view = make([]Entry, len(all), context.temp_allocator)
+	selected = make([]bool, len(all), context.temp_allocator)
+	files = refilter(all, view, selected, show_hidden, sort_by)
 	return
+}
+
+// rebuilds the visible listing from what read_dir already fetched. no disk, no
+// allocation, so re-sorting a huge directory costs a copy and a sort, not a re-read.
+refilter :: proc(all, view: []Entry, selected: []bool, show_hidden: bool, sort_by: Sort) -> []Entry {
+	n := 0
+	for e in all {
+		if show_hidden || (len(e.name) > 0 && e.name[0] != '.') {
+			view[n] = e
+			n += 1
+		}
+	}
+	files := view[:n]
+
+	// readdir order is whatever the fs feels like; sort or it looks broken
+	sort_files(files, sort_by)
+
+	// ticks belong to the listing they were made in
+	for i in 0 ..< len(selected) {
+		selected[i] = false
+	}
+	return files
 }
 
 Sort :: enum {
@@ -601,17 +625,17 @@ Sort :: enum {
 
 // readdir order is whatever the fs feels like; sort or it looks broken.
 // slice.sort_by takes a plain proc with no captured state, so each mode gets its own.
-sort_files :: proc(files: []os.File_Info, mode: Sort) {
+sort_files :: proc(files: []Entry, mode: Sort) {
 	switch mode {
 	case .Name:
-		slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+		slice.sort_by(files, proc(a, b: Entry) -> bool {
 			if ad, bd := a.type == .Directory, b.type == .Directory; ad != bd {
 				return ad
 			}
 			return a.name < b.name
 		})
 	case .Size:
-		slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+		slice.sort_by(files, proc(a, b: Entry) -> bool {
 			if ad, bd := a.type == .Directory, b.type == .Directory; ad != bd {
 				return ad
 			}
@@ -619,7 +643,7 @@ sort_files :: proc(files: []os.File_Info, mode: Sort) {
 			return a.size > b.size
 		})
 	case .Time:
-		slice.sort_by(files, proc(a, b: os.File_Info) -> bool {
+		slice.sort_by(files, proc(a, b: Entry) -> bool {
 			if ad, bd := a.type == .Directory, b.type == .Directory; ad != bd {
 				return ad
 			}
@@ -631,10 +655,10 @@ sort_files :: proc(files: []os.File_Info, mode: Sort) {
 
 @(test)
 test_sort_files :: proc(t: ^testing.T) {
-	files := []os.File_Info{
-		{name = "b.txt", size = 10, type = .Regular},
-		{name = "dir", type = .Directory},
-		{name = "a.txt", size = 30, type = .Regular},
+	files := []Entry{
+		{info = {name = "b.txt", size = 10, type = .Regular}},
+		{info = {name = "dir", type = .Directory}},
+		{info = {name = "a.txt", size = 30, type = .Regular}},
 	}
 
 	sort_files(files, .Name)
@@ -647,7 +671,7 @@ test_sort_files :: proc(t: ^testing.T) {
 	testing.expect(t, files[2].name == "b.txt", "smallest file last")
 }
 
-index_of :: proc(files: []os.File_Info, name: string) -> int {
+index_of :: proc(files: []Entry, name: string) -> int {
 	for f, i in files {
 		if f.name == name {
 			return i
@@ -850,7 +874,7 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // shortcut: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, links: []string, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
+draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
 
@@ -868,7 +892,7 @@ draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, links: []stri
 		f := files[i]
 		mark := "*" if selected[i] else " "
 		// a directory gets its slash, a link shows where it points
-		tail := links[i]
+		tail := f.link
 		if f.type == .Directory {
 			tail = "/"
 		}
