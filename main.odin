@@ -13,11 +13,45 @@ import "core:time/datetime"
 import tz "core:time/timezone"
 import "core:testing"
 
+// ENTER switches to the alternate screen so the user's terminal contents survive
+// us, LEAVE puts them back exactly as they were. no clearing: leaving the
+// alternate screen restores whatever was underneath.
+ENTER_SCREEN :: "\x1b[?1049h\x1b[?25l"
+LEAVE_SCREEN :: "\x1b[?25h\x1b[?1049l"
+
+// the signal handler takes only a signal number, so what it needs to undo lives here
+@(private = "file")
+cooked_termios: posix.termios
+@(private = "file")
+cooked_saved: bool
+
+// callable from a signal handler, so nothing in here may allocate or take a lock:
+// tcsetattr and write are async-signal-safe, fmt.print is emphatically not.
+restore_terminal :: proc "c" () {
+	if cooked_saved {
+		posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &cooked_termios)
+	}
+	_, _ = linux.write(linux.Fd(posix.STDOUT_FILENO), transmute([]u8)string(LEAVE_SCREEN))
+}
+
+// without this a kill leaves the terminal in raw mode: no echo, no line editing,
+// and a shell that looks broken. defer does not run for signals.
+on_signal :: proc "c" (sig: posix.Signal) {
+	restore_terminal()
+	linux.exit_group(128 + i32(sig))
+}
+
 main :: proc() {
 	cooked: posix.termios
 	posix.tcgetattr(posix.STDIN_FILENO, &cooked)
-	defer posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &cooked)
-	defer fmt.print("\x1b[2J\x1b[H\x1b[?25h")
+	cooked_termios, cooked_saved = cooked, true
+	defer restore_terminal()
+
+	act: posix.sigaction_t
+	act.sa_handler = on_signal
+	for sig in ([]posix.Signal{.SIGTERM, .SIGHUP, .SIGINT, .SIGQUIT}) {
+		posix.sigaction(sig, &act, nil)
+	}
 
 	raw := cooked
 	// isig off so ctrl-c arrives as byte 3 instead of killing us mid-raw-mode
@@ -25,7 +59,7 @@ main :: proc() {
 	raw.c_cc[.VMIN] = 1
 	raw.c_cc[.VTIME] = 0
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &raw)
-	fmt.print("\x1b[?25l")
+	fmt.print(ENTER_SCREEN)
 
 	// loaded once and kept for the whole run: file times come back as UTC, and a
 	// listing that says yesterday for a file you touched this evening is just wrong
@@ -879,8 +913,9 @@ open_in_editor :: proc(name: string, cooked, raw: ^posix.termios) -> (err: os.Er
 		editor = "vi"
 	}
 
+	// hand back a normal terminal: the editor draws its own alternate screen
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, cooked)
-	fmt.print("\x1b[2J\x1b[H\x1b[?25h")
+	fmt.print(LEAVE_SCREEN)
 
 	// nil on these handles means "close it", not "inherit it"
 	p, perr := os.process_start({
@@ -894,7 +929,7 @@ open_in_editor :: proc(name: string, cooked, raw: ^posix.termios) -> (err: os.Er
 	}
 
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, raw)
-	fmt.print("\x1b[?25l")
+	fmt.print(ENTER_SCREEN)
 	return perr
 }
 
