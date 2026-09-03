@@ -128,7 +128,7 @@ main :: proc() {
 				if os.set_working_directory(files[cursor].name) == nil {
 					cursor, offset = 0, 0
 				} else {
-					eerr = open_in_editor(files[cursor].name, &cooked, &raw)
+					eerr = open_in_editor(shell_env(files, selected, cursor, cwd), &cooked, &raw)
 				}
 				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
@@ -304,6 +304,16 @@ main :: proc() {
 					all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				}
 			}
+		case '!':
+			if cmd, got := ask("!", ""); got {
+				err := run_shell(cmd, shell_env(files, selected, cursor, cwd), &cooked, &raw, true)
+				// the command may have changed the directory under us
+				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
+				cursor = clamp(cursor, 0, max(len(files)-1, 0))
+				if err != nil {
+					msg = fmt.tprintf("could not run sh: %v", err)
+				}
+			}
 		case 'v':
 			if len(files) > 0 && files[cursor].type != .Directory {
 				preview(files[cursor].name)
@@ -347,6 +357,7 @@ HELP := [?]string{
 	"  .  show or hide dotfiles",
 	"",
 	"  v  peek inside a file",
+	"  !  run a shell command: $f current, $fs ticked, $fx ticked-or-current, $d dir",
 	"  space  tick a file; d, y and x then act on every ticked one",
 	"  a  create, end the name with / for a directory",
 	"  r  rename          d  delete",
@@ -906,20 +917,83 @@ index_of :: proc(files: []Entry, name: string) -> int {
 	return 0
 }
 
-// the editor wants a normal terminal and the whole screen, so give both back and take them again after
-open_in_editor :: proc(name: string, cooked, raw: ^posix.termios) -> (err: os.Error) {
-	editor := os.get_env("EDITOR", context.temp_allocator)
-	if editor == "" {
-		editor = "vi"
+// names reach the shell as environment variables and are never pasted into the
+// command text, so a filename holding a space, a quote or a newline cannot
+// break the command or turn into one.
+// shortcut: fs and fx are newline separated, so a filename containing a newline
+// is ambiguous. only / and NUL are actually illegal in a name. lf has the same
+// limit; revisit only if it ever bites.
+shell_vars :: proc(files: []Entry, selected: []bool, cursor: int, cwd: string) -> (f, fs, fx, d: string) {
+	d = cwd
+	if len(files) == 0 {
+		return
 	}
+	f = files[cursor].name
 
-	// hand back a normal terminal: the editor draws its own alternate screen
+	ticked := make([dynamic]Entry, 0, len(files), context.temp_allocator)
+	for e, i in files {
+		if selected[i] {
+			append(&ticked, e)
+		}
+	}
+	fs = join_names(ticked[:])
+	// targets() already falls back to the highlighted entry when nothing is ticked
+	fx = join_names(targets(files, selected, cursor))
+	return
+}
+
+join_names :: proc(files: []Entry) -> string {
+	out := make([dynamic]byte, 0, 256, context.temp_allocator)
+	for e, i in files {
+		if i > 0 {
+			append(&out, '\n')
+		}
+		append(&out, e.name)
+	}
+	return string(out[:])
+}
+
+shell_env :: proc(files: []Entry, selected: []bool, cursor: int, cwd: string) -> []string {
+	f, fs, fx, d := shell_vars(files, selected, cursor, cwd)
+	base, _ := os.environ(context.temp_allocator)
+
+	out := make([dynamic]string, 0, len(base) + 4, context.temp_allocator)
+	append(&out, ..base)
+	append(&out, fmt.tprintf("f=%s", f))
+	append(&out, fmt.tprintf("fs=%s", fs))
+	append(&out, fmt.tprintf("fx=%s", fx))
+	append(&out, fmt.tprintf("d=%s", d))
+	return out[:]
+}
+
+@(test)
+test_shell_vars :: proc(t: ^testing.T) {
+	files := []Entry{{info = {name = "a"}}, {info = {name = "b"}}, {info = {name = "c"}}}
+
+	f, fs, fx, d := shell_vars(files, []bool{false, false, false}, 1, "/tmp")
+	testing.expect(t, f == "b", "f is the highlighted entry")
+	testing.expect(t, fs == "", "fs is empty when nothing is ticked")
+	testing.expect(t, fx == "b", "fx falls back to the highlighted entry")
+	testing.expect(t, d == "/tmp", "d is the current directory")
+
+	f, fs, fx, _ = shell_vars(files, []bool{true, false, true}, 1, "/tmp")
+	testing.expect(t, f == "b", "f ignores the ticks")
+	testing.expect(t, fs == "a\nc", "fs lists every ticked entry")
+	testing.expect(t, fx == "a\nc", "fx prefers the ticks over the cursor")
+
+	f, fs, fx, d = shell_vars(files[:0], []bool{}, 0, "/tmp")
+	testing.expect(t, f == "" && fs == "" && fx == "", "an empty listing yields empty variables")
+	testing.expect(t, d == "/tmp", "the directory is reported even when empty")
+}
+
+// hands the terminal over whole, the same way an editor needs it, and takes it back after
+run_shell :: proc(command: string, env: []string, cooked, raw: ^posix.termios, wait_for_key: bool) -> (err: os.Error) {
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, cooked)
 	fmt.print(LEAVE_SCREEN)
 
-	// nil on these handles means "close it", not "inherit it"
 	p, perr := os.process_start({
-		command = {editor, name},
+		command = {"sh", "-c", command},
+		env     = env,
 		stdin   = os.stdin,
 		stdout  = os.stdout,
 		stderr  = os.stderr,
@@ -929,8 +1003,23 @@ open_in_editor :: proc(name: string, cooked, raw: ^posix.termios) -> (err: os.Er
 	}
 
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, raw)
+	if wait_for_key {
+		// otherwise the listing paints over whatever the command printed
+		fmt.print("\n[press any key]")
+		read_key()
+	}
 	fmt.print(ENTER_SCREEN)
 	return perr
+}
+
+// one caller of run_shell among others now. going through sh also means an
+// EDITOR with arguments, like "code -w", finally works.
+open_in_editor :: proc(env: []string, cooked, raw: ^posix.termios) -> os.Error {
+	editor := os.get_env("EDITOR", context.temp_allocator)
+	if editor == "" {
+		editor = "vi"
+	}
+	return run_shell(fmt.tprintf(`%s "$f"`, editor), env, cooked, raw, false)
 }
 
 read_key :: proc() -> (key: byte, ok: bool) {
