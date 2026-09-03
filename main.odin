@@ -222,6 +222,15 @@ main :: proc() {
 					msg = fmt.tprintf("create failed: %v", err)
 				}
 			}
+		case 'R':
+			// keep the highlight on the same entry: a refresh can shift every index
+			keep: [256]byte
+			kn := 0
+			if len(files) > 0 {
+				kn = copy(keep[:], files[cursor].name)
+			}
+			files, cwd, selected = load(show_hidden, sort_by)
+			cursor = clamp(index_of(files, string(keep[:kn])), 0, max(len(files)-1, 0))
 		case 'c':
 			if path, got := ask("go to: ", ""); got {
 				target := expand_home(path, os.get_env("HOME", context.temp_allocator))
@@ -268,6 +277,7 @@ HELP := [?]string{
 	"  g  top             G  bottom",
 	"  h  parent dir      l  enter dir, or open file in $EDITOR",
 	"  c  go to a path, ~ included",
+	"  R  re-read the folder from disk",
 	"",
 	"  /  search          n  next match",
 	"  s  cycle sort: name / size / time",
