@@ -109,7 +109,7 @@ main :: proc() {
 
 		// a user binding wins over the built-in key, so anything here is theirs
 		if b, bound := binding_for(cfg.bindings[:], key); bound {
-			err := run_shell(b.command, shell_env(files, selected, cursor, cwd), &cooked, &raw, b.interactive, b.interactive)
+			err := run_shell(b.command, shell_env(files, selected, cursor, cwd), shell_args(files, selected, cursor), &cooked, &raw, b.interactive, b.interactive)
 			all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 			cursor = clamp(cursor, 0, max(len(files)-1, 0))
 			if err != nil {
@@ -153,7 +153,7 @@ main :: proc() {
 				if os.set_working_directory(files[cursor].name) == nil {
 					cursor, offset = 0, 0
 				} else {
-					eerr = open_in_editor(shell_env(files, selected, cursor, cwd), &cooked, &raw)
+					eerr = open_in_editor(shell_env(files, selected, cursor, cwd), shell_args(files, selected, cursor), &cooked, &raw)
 				}
 				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
@@ -331,7 +331,7 @@ main :: proc() {
 			}
 		case '!':
 			if cmd, got := ask("!", ""); got {
-				err := run_shell(cmd, shell_env(files, selected, cursor, cwd), &cooked, &raw, true, true)
+				err := run_shell(cmd, shell_env(files, selected, cursor, cwd), shell_args(files, selected, cursor), &cooked, &raw, true, true)
 				// the command may have changed the directory under us
 				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
@@ -392,7 +392,7 @@ HELP := [?]string{
 	"  .  show or hide dotfiles",
 	"",
 	"  v  peek inside a file",
-	"  !  run a shell command: $f current, $fs ticked, $fx ticked-or-current, $d dir",
+	"  !  run a shell command: \"$@\" ticked files, $f current, $d dir",
 	"  space  tick a file; d, y and x then act on every ticked one",
 	"  a  create, end the name with / for a directory",
 	"  r  rename          d  delete",
@@ -405,6 +405,7 @@ HELP := [?]string{
 	"",
 	"  ~/.config/gunti/config:  set sort name|size|time,  set hidden true|false",
 	"                          map <key> <command>,  ! prefix = show output",
+	"                          in commands: \"$@\" = the files to act on",
 }
 
 // enough for any sane terminal, and it means previewing a 4GB log reads 32KB of it
@@ -1133,51 +1134,39 @@ index_of :: proc(files: []Entry, name: string) -> int {
 	return 0
 }
 
-// names reach the shell as environment variables and are never pasted into the
-// command text, so a filename holding a space, a quote or a newline cannot
-// break the command or turn into one.
-// shortcut: fs and fx are newline separated, so a filename containing a newline
-// is ambiguous. only / and NUL are actually illegal in a name. lf has the same
-// limit; revisit only if it ever bites.
-shell_vars :: proc(files: []Entry, selected: []bool, cursor: int, cwd: string) -> (f, fs, fx, d: string) {
+// $f and $d are single values, so they are safe as environment variables and a
+// filename holding a space or a quote cannot break them.
+//
+// the ticked files are NOT passed this way. joining names with newlines and
+// letting the shell split them again is broken for any name containing a space:
+// quoting the variable makes one argument, not quoting it splits on spaces too.
+// they go through as positional arguments instead, where "$@" preserves every
+// name exactly, whatever is in it.
+shell_vars :: proc(files: []Entry, selected: []bool, cursor: int, cwd: string) -> (f, d: string) {
 	d = cwd
-	if len(files) == 0 {
-		return
+	if len(files) > 0 {
+		f = files[cursor].name
 	}
-	f = files[cursor].name
-
-	ticked := make([dynamic]Entry, 0, len(files), context.temp_allocator)
-	for e, i in files {
-		if selected[i] {
-			append(&ticked, e)
-		}
-	}
-	fs = join_names(ticked[:])
-	// targets() already falls back to the highlighted entry when nothing is ticked
-	fx = join_names(targets(files, selected, cursor))
 	return
 }
 
-join_names :: proc(files: []Entry) -> string {
-	out := make([dynamic]byte, 0, 256, context.temp_allocator)
-	for e, i in files {
-		if i > 0 {
-			append(&out, '\n')
-		}
-		append(&out, e.name)
+// the ticked entries, or the highlighted one when nothing is ticked
+shell_args :: proc(files: []Entry, selected: []bool, cursor: int) -> []string {
+	picked := targets(files, selected, cursor)
+	out := make([]string, len(picked), context.temp_allocator)
+	for e, i in picked {
+		out[i] = e.name
 	}
-	return string(out[:])
+	return out
 }
 
 shell_env :: proc(files: []Entry, selected: []bool, cursor: int, cwd: string) -> []string {
-	f, fs, fx, d := shell_vars(files, selected, cursor, cwd)
+	f, d := shell_vars(files, selected, cursor, cwd)
 	base, _ := os.environ(context.temp_allocator)
 
-	out := make([dynamic]string, 0, len(base) + 4, context.temp_allocator)
+	out := make([dynamic]string, 0, len(base) + 2, context.temp_allocator)
 	append(&out, ..base)
 	append(&out, fmt.tprintf("f=%s", f))
-	append(&out, fmt.tprintf("fs=%s", fs))
-	append(&out, fmt.tprintf("fx=%s", fx))
 	append(&out, fmt.tprintf("d=%s", d))
 	return out[:]
 }
@@ -1186,35 +1175,48 @@ shell_env :: proc(files: []Entry, selected: []bool, cursor: int, cwd: string) ->
 test_shell_vars :: proc(t: ^testing.T) {
 	files := []Entry{{info = {name = "a"}}, {info = {name = "b"}}, {info = {name = "c"}}}
 
-	f, fs, fx, d := shell_vars(files, []bool{false, false, false}, 1, "/tmp")
+	f, d := shell_vars(files, []bool{false, false, false}, 1, "/tmp")
 	testing.expect(t, f == "b", "f is the highlighted entry")
-	testing.expect(t, fs == "", "fs is empty when nothing is ticked")
-	testing.expect(t, fx == "b", "fx falls back to the highlighted entry")
 	testing.expect(t, d == "/tmp", "d is the current directory")
 
-	f, fs, fx, _ = shell_vars(files, []bool{true, false, true}, 1, "/tmp")
-	testing.expect(t, f == "b", "f ignores the ticks")
-	testing.expect(t, fs == "a\nc", "fs lists every ticked entry")
-	testing.expect(t, fx == "a\nc", "fx prefers the ticks over the cursor")
-
-	f, fs, fx, d = shell_vars(files[:0], []bool{}, 0, "/tmp")
-	testing.expect(t, f == "" && fs == "" && fx == "", "an empty listing yields empty variables")
+	f, d = shell_vars(files[:0], []bool{}, 0, "/tmp")
+	testing.expect(t, f == "", "an empty listing has no current file")
 	testing.expect(t, d == "/tmp", "the directory is reported even when empty")
+}
+
+@(test)
+test_shell_args :: proc(t: ^testing.T) {
+	files := []Entry{{info = {name = "a"}}, {info = {name = "two words"}}, {info = {name = "c"}}}
+
+	args := shell_args(files, []bool{false, false, false}, 1)
+	testing.expect(t, len(args) == 1 && args[0] == "two words", "with nothing ticked, the highlighted entry is the argument")
+
+	args = shell_args(files, []bool{true, true, false}, 0)
+	testing.expect(t, len(args) == 2, "every ticked entry becomes its own argument")
+	testing.expect(t, args[0] == "a" && args[1] == "two words", "a name with a space stays one argument")
+
+	testing.expect(t, len(shell_args(files[:0], []bool{}, 0)) == 0, "an empty listing has no arguments")
 }
 
 // hands the terminal over whole, the same way an editor needs it, and takes it back after
 // interactive hands the whole terminal over, for anything that draws or asks.
 // quiet keeps our screen and throws the command's output away, so a binding
 // like a clipboard copy does not flash the display for a job with no output.
-run_shell :: proc(command: string, env: []string, cooked, raw: ^posix.termios, interactive, wait_for_key: bool) -> (err: os.Error) {
+run_shell :: proc(command: string, env, args: []string, cooked, raw: ^posix.termios, interactive, wait_for_key: bool) -> (err: os.Error) {
 	if interactive {
 		posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, cooked)
 		fmt.print(LEAVE_SCREEN)
 	}
 
+	// "sh -c CMD gunti a b c" puts the files in $1.. and $@. this is the only
+	// way to hand over names holding spaces, quotes or newlines untouched.
+	argv := make([dynamic]string, 0, len(args) + 4, context.temp_allocator)
+	append(&argv, "sh", "-c", command, "gunti")
+	append(&argv, ..args)
+
 	// nil on these handles means "close it", not "inherit it"
 	p, perr := os.process_start({
-		command = {"sh", "-c", command},
+		command = argv[:],
 		env     = env,
 		stdin   = os.stdin if interactive else nil,
 		stdout  = os.stdout if interactive else nil,
@@ -1238,12 +1240,12 @@ run_shell :: proc(command: string, env: []string, cooked, raw: ^posix.termios, i
 
 // one caller of run_shell among others now. going through sh also means an
 // EDITOR with arguments, like "code -w", finally works.
-open_in_editor :: proc(env: []string, cooked, raw: ^posix.termios) -> os.Error {
+open_in_editor :: proc(env, args: []string, cooked, raw: ^posix.termios) -> os.Error {
 	editor := os.get_env("EDITOR", context.temp_allocator)
 	if editor == "" {
 		editor = "vi"
 	}
-	return run_shell(fmt.tprintf(`%s "$f"`, editor), env, cooked, raw, true, false)
+	return run_shell(fmt.tprintf(`%s "$f"`, editor), env, args, cooked, raw, true, false)
 }
 
 read_key :: proc() -> (key: byte, ok: bool) {
