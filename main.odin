@@ -721,6 +721,10 @@ draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offse
 
 	if len(files) == 0 {
 		fmt.print("(empty or unreadable)")
+		// an empty listing is exactly when you need to be told why, so say it here too
+		if msg != "" {
+			fmt.printf("\n\x1b[7m %s \x1b[0m", fit(msg, cols-2))
+		}
 		return
 	}
 
