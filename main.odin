@@ -68,8 +68,7 @@ main :: proc() {
 	local, _ := tz.region_load_from_file("/etc/localtime", "local")
 
 	cursor, offset := 0, 0
-	show_hidden := false
-	sort_by := Sort.Name
+	cfg := Config{sort = .Name}
 	msg: string
 	// an absent or unreadable config leaves the defaults above exactly as they were.
 	// the complaint goes in a plain buffer: read_dir below frees the temp arena
@@ -77,7 +76,7 @@ main :: proc() {
 	problem: [256]byte
 	problem_n := 0
 	if text, err := os.read_entire_file(config_path(context.temp_allocator), context.temp_allocator); err == nil {
-		problem_n = copy(problem[:], parse_config(string(text), &sort_by, &show_hidden))
+		problem_n = copy(problem[:], parse_config(string(text), &cfg))
 	}
 	// the clipboard has to outlive load(), which frees the arena entry names live in.
 	// sized for many paths now that a tick list can be pasted in one go.
@@ -87,6 +86,10 @@ main :: proc() {
 	// the query outlives the arena ask() used, so n can repeat it later
 	query: [256]byte
 	query_n := 0
+	// plain locals from here on: the rest of the loop mutates these as you
+	// press keys, the config only decides where they start
+	sort_by, show_hidden := cfg.sort, cfg.hidden
+
 	all, view, files, selected, cwd := read_dir(show_hidden, sort_by)
 	msg = string(problem[:problem_n])
 	for {
@@ -101,6 +104,17 @@ main :: proc() {
 			break
 		}
 		msg = "" // messages live exactly one frame, and must die before load() frees them
+
+		// a user binding wins over the built-in key, so anything here is theirs
+		if b, bound := binding_for(cfg.bindings[:], key); bound {
+			err := run_shell(b.command, shell_env(files, selected, cursor, cwd), &cooked, &raw, b.interactive, b.interactive)
+			all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
+			cursor = clamp(cursor, 0, max(len(files)-1, 0))
+			if err != nil {
+				msg = fmt.tprintf("could not run sh: %v", err)
+			}
+			continue
+		}
 
 		switch key {
 		case 'q', 3:
@@ -315,7 +329,7 @@ main :: proc() {
 			}
 		case '!':
 			if cmd, got := ask("!", ""); got {
-				err := run_shell(cmd, shell_env(files, selected, cursor, cwd), &cooked, &raw, true)
+				err := run_shell(cmd, shell_env(files, selected, cursor, cwd), &cooked, &raw, true, true)
 				// the command may have changed the directory under us
 				all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
@@ -376,6 +390,9 @@ HELP := [?]string{
 	"  ?  this help       q  quit",
 	"",
 	"  arrows work as hjkl, backspace as h, enter as l",
+	"",
+	"  ~/.config/gunti/config:  set sort name|size|time,  set hidden true|false",
+	"                          map <key> <command>,  ! prefix = show output",
 }
 
 // enough for any sane terminal, and it means previewing a 4GB log reads 32KB of it
@@ -571,11 +588,25 @@ config_path :: proc(allocator: runtime.Allocator) -> string {
 	return fmt.tprintf("%s/.config/gunti/config", os.get_env("HOME", allocator))
 }
 
+Binding :: struct {
+	key:         byte,
+	command:     string,
+	// set by a leading "!": hand the terminal over and pause afterwards, for
+	// anything that draws or prints. without it the command runs unseen.
+	interactive: bool,
+}
+
+Config :: struct {
+	sort:     Sort,
+	hidden:   bool,
+	bindings: [dynamic]Binding,
+}
+
 // line based on purpose: no format library, no dependency, and the whole grammar
 // fits in this proc. returns the first line it could not understand, "" if fine.
 // there is deliberately no "set editor": $EDITOR already does that job, so the
 // core has no business growing a second way to say it.
-parse_config :: proc(text: string, sort_by: ^Sort, show_hidden: ^bool) -> string {
+parse_config :: proc(text: string, cfg: ^Config, allocator := context.allocator) -> string {
 	rest := text
 	line_no := 0
 	for line in strings.split_lines_iterator(&rest) {
@@ -585,29 +616,58 @@ parse_config :: proc(text: string, sort_by: ^Sort, show_hidden: ^bool) -> string
 			continue
 		}
 
+		// map keeps the rest of the line verbatim, so splitting into words is
+		// only safe for set. a command's own spacing is its business.
+		if strings.has_prefix(trimmed, "map ") {
+			body := strings.trim_space(trimmed[4:])
+			space := strings.index_byte(body, ' ')
+			if space < 1 {
+				return fmt.tprintf("config line %d: expected: map <key> <command>", line_no)
+			}
+			if space != 1 {
+				return fmt.tprintf("config line %d: a key must be a single character", line_no)
+			}
+			command := strings.trim_space(body[2:])
+			if command == "" {
+				return fmt.tprintf("config line %d: map needs a command", line_no)
+			}
+
+			b := Binding{key = body[0], interactive = command[0] == '!'}
+			if b.interactive {
+				command = strings.trim_space(command[1:])
+				if command == "" {
+					return fmt.tprintf("config line %d: map needs a command", line_no)
+				}
+			}
+			// cloned: the config text lives in the temp arena, which read_dir frees
+			b.command = strings.clone(command, allocator)
+			append(&cfg.bindings, b)
+			continue
+		}
+
 		f := strings.fields(trimmed, context.temp_allocator)
 		if len(f) != 3 || f[0] != "set" {
-			return fmt.tprintf("config line %d: expected: set <option> <value>", line_no)
+			return fmt.tprintf("config line %d: expected: set <option> <value>, or map <key> <command>", line_no)
 		}
 
 		switch f[1] {
 		case "sort":
 			switch f[2] {
 			case "name":
-				sort_by^ = .Name
+				cfg.sort = .Name
 			case "size":
-				sort_by^ = .Size
+				cfg.sort = .Size
 			case "time":
-				sort_by^ = .Time
+				cfg.sort = .Time
 			case:
 				return fmt.tprintf("config line %d: sort must be name, size or time", line_no)
 			}
 		case "hidden":
 			switch f[2] {
 			case "true":
-				show_hidden^ = true
+				cfg.hidden = true
 			case "false":
-				show_hidden^ = false
+				cfg.hidden = false
 			case:
 				return fmt.tprintf("config line %d: hidden must be true or false", line_no)
 			}
@@ -618,27 +678,73 @@ parse_config :: proc(text: string, sort_by: ^Sort, show_hidden: ^bool) -> string
 	return ""
 }
 
+binding_for :: proc(bindings: []Binding, key: byte) -> (Binding, bool) {
+	// last wins, so a later line in the config overrides an earlier one
+	#reverse for b in bindings {
+		if b.key == key {
+			return b, true
+		}
+	}
+	return {}, false
+}
+
 @(test)
 test_parse_config :: proc(t: ^testing.T) {
-	sort_by := Sort.Name
-	hidden := false
+	cfg := Config{sort = .Name}
+	defer delete(cfg.bindings)
 
 	// comments, blank lines and stray whitespace are all fine
-	problem := parse_config("# a comment\n\n  set sort size  \nset hidden true\n", &sort_by, &hidden)
+	problem := parse_config("# a comment\n\n  set sort size  \nset hidden true\n", &cfg)
 	testing.expect(t, problem == "", "a valid config reports no problem")
-	testing.expect(t, sort_by == .Size, "sort was applied")
-	testing.expect(t, hidden, "hidden was applied")
+	testing.expect(t, cfg.sort == .Size, "sort was applied")
+	testing.expect(t, cfg.hidden, "hidden was applied")
 
 	// an empty config must change nothing
-	sort_by, hidden = .Time, false
-	testing.expect(t, parse_config("", &sort_by, &hidden) == "", "empty config is valid")
-	testing.expect(t, sort_by == .Time && !hidden, "empty config changes nothing")
+	cfg2 := Config{sort = .Time}
+	defer delete(cfg2.bindings)
+	testing.expect(t, parse_config("", &cfg2) == "", "empty config is valid")
+	testing.expect(t, cfg2.sort == .Time && !cfg2.hidden, "empty config changes nothing")
 
-	testing.expect(t, parse_config("set sort sideways\n", &sort_by, &hidden) != "", "a bad value is reported")
-	testing.expect(t, parse_config("set hidden yes\n", &sort_by, &hidden) != "", "hidden takes true or false only")
-	testing.expect(t, parse_config("set nosuchoption 1\n", &sort_by, &hidden) != "", "an unknown option is reported")
-	testing.expect(t, parse_config("sort size\n", &sort_by, &hidden) != "", "a line must start with set")
-	testing.expect(t, parse_config("set sort\n", &sort_by, &hidden) != "", "a truncated line is reported")
+	testing.expect(t, parse_config("set sort sideways\n", &cfg2) != "", "a bad value is reported")
+	testing.expect(t, parse_config("set hidden yes\n", &cfg2) != "", "hidden takes true or false only")
+	testing.expect(t, parse_config("set nosuchoption 1\n", &cfg2) != "", "an unknown option is reported")
+	testing.expect(t, parse_config("sort size\n", &cfg2) != "", "a line must start with set or map")
+	testing.expect(t, parse_config("set sort\n", &cfg2) != "", "a truncated line is reported")
+}
+
+@(test)
+test_parse_map :: proc(t: ^testing.T) {
+	cfg := Config{}
+	defer delete(cfg.bindings)
+
+	problem := parse_config("map D rm -rf -- \"$fx\"\nmap L !less \"$f\"\n", &cfg)
+	testing.expect(t, problem == "", "valid map lines report no problem")
+	testing.expect(t, len(cfg.bindings) == 2, "both bindings were kept")
+
+	b, ok := binding_for(cfg.bindings[:], 'D')
+	testing.expect(t, ok, "D is bound")
+	testing.expect(t, b.command == `rm -rf -- "$fx"`, "the command keeps its own spacing and quoting")
+	testing.expect(t, !b.interactive, "no bang means it runs unseen")
+
+	b, ok = binding_for(cfg.bindings[:], 'L')
+	testing.expect(t, ok && b.interactive, "a leading bang means interactive")
+	testing.expect(t, b.command == `less "$f"`, "the bang is stripped from the command")
+
+	_, ok = binding_for(cfg.bindings[:], 'Z')
+	testing.expect(t, !ok, "an unbound key is not found")
+
+	// a later line overrides an earlier one
+	cfg3 := Config{}
+	defer delete(cfg3.bindings)
+	parse_config("map D first\nmap D second\n", &cfg3)
+	b, _ = binding_for(cfg3.bindings[:], 'D')
+	testing.expect(t, b.command == "second", "the last binding for a key wins")
+
+	cfg4 := Config{}
+	defer delete(cfg4.bindings)
+	testing.expect(t, parse_config("map DD something\n", &cfg4) != "", "a multi-character key is refused")
+	testing.expect(t, parse_config("map D\n", &cfg4) != "", "map needs a command")
+	testing.expect(t, parse_config("map D !\n", &cfg4) != "", "a bare bang is not a command")
 }
 
 // the ticked entries, or just the highlighted one when nothing is ticked
@@ -1074,28 +1180,36 @@ test_shell_vars :: proc(t: ^testing.T) {
 }
 
 // hands the terminal over whole, the same way an editor needs it, and takes it back after
-run_shell :: proc(command: string, env: []string, cooked, raw: ^posix.termios, wait_for_key: bool) -> (err: os.Error) {
-	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, cooked)
-	fmt.print(LEAVE_SCREEN)
+// interactive hands the whole terminal over, for anything that draws or asks.
+// quiet keeps our screen and throws the command's output away, so a binding
+// like a clipboard copy does not flash the display for a job with no output.
+run_shell :: proc(command: string, env: []string, cooked, raw: ^posix.termios, interactive, wait_for_key: bool) -> (err: os.Error) {
+	if interactive {
+		posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, cooked)
+		fmt.print(LEAVE_SCREEN)
+	}
 
+	// nil on these handles means "close it", not "inherit it"
 	p, perr := os.process_start({
 		command = {"sh", "-c", command},
 		env     = env,
-		stdin   = os.stdin,
-		stdout  = os.stdout,
-		stderr  = os.stderr,
+		stdin   = os.stdin if interactive else nil,
+		stdout  = os.stdout if interactive else nil,
+		stderr  = os.stderr if interactive else nil,
 	})
 	if perr == nil {
 		_, _ = os.process_wait(p)
 	}
 
-	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, raw)
-	if wait_for_key {
-		// otherwise the listing paints over whatever the command printed
-		fmt.print("\n[press any key]")
-		read_key()
+	if interactive {
+		posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, raw)
+		if wait_for_key {
+			// otherwise the listing paints over whatever the command printed
+			fmt.print("\n[press any key]")
+			read_key()
+		}
+		fmt.print(ENTER_SCREEN)
 	}
-	fmt.print(ENTER_SCREEN)
 	return perr
 }
 
@@ -1106,7 +1220,7 @@ open_in_editor :: proc(env: []string, cooked, raw: ^posix.termios) -> os.Error {
 	if editor == "" {
 		editor = "vi"
 	}
-	return run_shell(fmt.tprintf(`%s "$f"`, editor), env, cooked, raw, false)
+	return run_shell(fmt.tprintf(`%s "$f"`, editor), env, cooked, raw, true, false)
 }
 
 read_key :: proc() -> (key: byte, ok: bool) {
