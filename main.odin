@@ -200,6 +200,10 @@ main :: proc() {
 					msg = fmt.tprintf("create failed: %v", err)
 				}
 			}
+		case 'v':
+			if len(files) > 0 && files[cursor].type != .Directory {
+				preview(files[cursor].name)
+			}
 		case '?':
 			help()
 		case '/', 'n':
@@ -236,6 +240,7 @@ HELP := [?]string{
 	"  s  cycle sort: name / size / time",
 	"  .  show or hide dotfiles",
 	"",
+	"  v  peek inside a file",
 	"  a  create, end the name with / for a directory",
 	"  r  rename          d  delete",
 	"  y  copy            x  cut            p  paste",
@@ -243,6 +248,58 @@ HELP := [?]string{
 	"  ?  this help       q  quit",
 	"",
 	"  arrows work as hjkl, backspace as h, enter as l",
+}
+
+// enough for any sane terminal, and it means previewing a 4GB log reads 32KB of it
+PREVIEW_BYTES :: 32 * 1024
+
+// a NUL byte means it is not text, and dumping it raw would garble the terminal
+is_binary :: proc(data: []byte) -> bool {
+	return slice.contains(data, 0)
+}
+
+@(test)
+test_is_binary :: proc(t: ^testing.T) {
+	testing.expect(t, !is_binary(transmute([]byte)string("hello\nworld")), "plain text is not binary")
+	testing.expect(t, is_binary([]byte{'a', 0, 'b'}), "an embedded NUL means binary")
+	testing.expect(t, !is_binary([]byte{}), "an empty file is not binary")
+}
+
+// any key returns, same as help
+preview :: proc(name: string) {
+	rows, cols := term_size()
+	fmt.print("\x1b[2J\x1b[H")
+	fmt.printfln("\x1b[1m%s\x1b[0m", fit(name, cols))
+
+	buf: [PREVIEW_BYTES]byte
+	n: int
+	if f, err := os.open(name); err != nil {
+		fmt.printf("cannot read: %v", err)
+	} else {
+		defer os.close(f)
+		n, _ = os.read(f, buf[:])
+		data := buf[:n]
+		switch {
+		case n == 0:
+			fmt.print("(empty)")
+		case is_binary(data):
+			fmt.print("(binary)")
+		case:
+			// rows-2 leaves the header and the footer their own lines
+			printed := 0
+			text := string(data)
+			for line in strings.split_lines_iterator(&text) {
+				if printed >= rows-2 {
+					break
+				}
+				fmt.println(fit(line, cols))
+				printed += 1
+			}
+		}
+	}
+
+	bar(" press any key ")
+	read_key()
 }
 
 // any key returns, so there is nothing to learn to get back out
