@@ -26,20 +26,21 @@ main :: proc() {
 	show_hidden := false
 	sort_by := Sort.Name
 	msg: string
-	// the clipboard has to outlive load(), which frees the arena entry names live in
-	clip: [4096]byte
+	// the clipboard has to outlive load(), which frees the arena entry names live in.
+	// sized for many paths now that a tick list can be pasted in one go.
+	clip: [64 * 1024]byte
 	clip_n := 0
 	clip_cut := false
 	// the query outlives the arena ask() used, so n can repeat it later
 	query: [256]byte
 	query_n := 0
-	files, cwd := load(show_hidden, sort_by)
+	files, cwd, selected := load(show_hidden, sort_by)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, cursor, offset, rows, cols, msg, sort_by)
+		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by)
 
 		key, ok := read_key()
 		if !ok {
@@ -58,14 +59,20 @@ main :: proc() {
 			cursor = 0
 		case 'G':
 			cursor = max(len(files)-1, 0)
+		case ' ':
+			if len(files) > 0 {
+				selected[cursor] = !selected[cursor]
+				// step down so a run of files ticks with repeated taps
+				cursor = min(cursor+1, len(files)-1)
+			}
 		case 's':
 			sort_by = Sort((int(sort_by) + 1) % len(Sort))
 			cursor, offset = 0, 0
-			files, cwd = load(show_hidden, sort_by)
+			files, cwd, selected = load(show_hidden, sort_by)
 		case '.':
 			show_hidden = !show_hidden
 			cursor, offset = 0, 0
-			files, cwd = load(show_hidden, sort_by)
+			files, cwd, selected = load(show_hidden, sort_by)
 		case 'l', '\r', '\n':
 			if len(files) > 0 {
 				// try to walk in first: chdir fails on a regular file, and symlinked dirs work free
@@ -76,7 +83,7 @@ main :: proc() {
 				} else {
 					eerr = open_in_editor(files[cursor].name, &cooked, &raw)
 				}
-				files, cwd = load(show_hidden, sort_by)
+				files, cwd, selected = load(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
 				if eerr != nil {
 					msg = fmt.tprintf("could not run $EDITOR: %v", eerr)
@@ -87,19 +94,25 @@ main :: proc() {
 			leaving: [256]byte
 			n := copy(leaving[:], os.base(cwd))
 			if os.set_working_directory("..") == nil {
-				files, cwd = load(show_hidden, sort_by)
+				files, cwd, selected = load(show_hidden, sort_by)
 				cursor, offset = index_of(files, string(leaving[:n])), 0
 			}
 		case 'd':
 			if len(files) > 0 {
-				name := files[cursor].name
+				victims := targets(files, selected, cursor)
 				// remove() is rmdir for directories, so a non-empty one refuses to die. keep it that way.
-				if confirm(fmt.tprintf("delete %s? (y/N) ", name)) {
-					if err := os.remove(name); err != nil {
-						msg = fmt.tprintf("delete failed: %v", err)
-					} else {
-						files, cwd = load(show_hidden, sort_by)
-						cursor = clamp(cursor, 0, max(len(files)-1, 0))
+				if confirm(fmt.tprintf("delete %s? (y/N) ", describe(victims))) {
+					failed := 0
+					for v in victims {
+						if os.remove(v.name) != nil {
+							failed += 1
+						}
+					}
+					total := len(victims)
+					files, cwd, selected = load(show_hidden, sort_by)
+					cursor = clamp(cursor, 0, max(len(files)-1, 0))
+					if failed > 0 {
+						msg = fmt.tprintf("%d of %d could not be deleted", failed, total)
 					}
 				}
 			}
@@ -117,65 +130,65 @@ main :: proc() {
 					if err := os.rename(old, name); err != nil {
 						msg = fmt.tprintf("rename failed: %v", err)
 					} else {
-						files, cwd = load(show_hidden, sort_by)
+						files, cwd, selected = load(show_hidden, sort_by)
 						cursor = clamp(index_of(files, string(renamed[:rn])), 0, max(len(files)-1, 0))
 					}
 				}
 			}
 		case 'y', 'x':
 			if len(files) > 0 {
-				name := files[cursor].name
-				clip_n = join_path(clip[:], cwd, name)
+				picked := targets(files, selected, cursor)
+				clip_n = 0
 				clip_cut = key == 'x'
-				if clip_n == 0 {
-					msg = "path too long to hold"
+				held := 0
+				for f in picked {
+					n := join_path(clip[clip_n:], cwd, f.name)
+					// one newline per entry, so leave room for it before committing
+					if n == 0 || clip_n+n+1 > len(clip) {
+						break
+					}
+					clip_n += n
+					clip[clip_n] = '\n'
+					clip_n += 1
+					held += 1
+				}
+				if held < len(picked) {
+					msg = fmt.tprintf("only %d of %d fit", held, len(picked))
 				} else {
-					msg = fmt.tprintf("%s %s", "cut" if clip_cut else "yanked", name)
+					msg = fmt.tprintf("%s %s", "cut" if clip_cut else "yanked", describe(picked))
 				}
 			}
 		case 'p':
 			if clip_n > 0 {
-				src := string(clip[:clip_n])
-				// paste lands in the directory we're standing in, under the same name
-				name := os.base(src)
-				dbuf: [4096]byte
-				dn := join_path(dbuf[:], cwd, name)
-				if dn == 0 {
-					msg = "path too long to paste"
-					break
+				problem: [256]byte
+				pn := 0
+				last: [256]byte
+				ln := 0
+				pasted := 0
+
+				paths := string(clip[:clip_n])
+				for src in strings.split_lines_iterator(&paths) {
+					if src == "" {
+						continue
+					}
+					name, why := paste_one(src, cwd, clip_cut)
+					ln = copy(last[:], name)
+					if why != "" {
+						pn = copy(problem[:], why)
+					} else {
+						pasted += 1
+					}
 				}
-				if string(dbuf[:dn]) == src {
-					// copy_file opens dst with O_TRUNC while src is still open, and empties it
-					msg = "source and destination are the same"
-					break
+				// only forget a cut once every piece of it landed
+				if pn == 0 && clip_cut {
+					clip_n = 0
 				}
-				if os.is_directory(src) && under(cwd, src) {
-					// the copy would walk into the copy it is making, until the path runs out
-					msg = "cannot paste a directory into itself"
-					break
-				}
-				// rename and copy_file both clobber the target silently, so do the asking ourselves
-				if os.exists(name) && !confirm(fmt.tprintf("overwrite %s? (y/N) ", name)) {
-					break
-				}
-				err: os.Error
-				switch {
-				case clip_cut:
-					// moves files and directories alike, but only within one filesystem
-					err = os.rename(src, name)
-				case os.is_directory(src):
-					err = os.copy_directory_all(name, src)
-				case:
-					// dst first, src second: backwards from cp(1) and from os.rename above
-					err = os.copy_file(name, src)
-				}
-				if err == nil && clip_cut {
-					clip_n = 0 // the source moved, so the clipboard points at nothing
-				}
-				files, cwd = load(show_hidden, sort_by)
-				cursor = clamp(index_of(files, name), 0, max(len(files)-1, 0))
-				if err != nil {
-					msg = fmt.tprintf("paste failed: %v", err)
+				files, cwd, selected = load(show_hidden, sort_by)
+				cursor = clamp(index_of(files, string(last[:ln])), 0, max(len(files)-1, 0))
+				if pn > 0 {
+					msg = fmt.tprintf("%s", string(problem[:pn]))
+				} else if pasted > 1 {
+					msg = fmt.tprintf("pasted %d items", pasted)
 				}
 			}
 		case 'a':
@@ -194,7 +207,7 @@ main :: proc() {
 				} else {
 					err = create_file(name)
 				}
-				files, cwd = load(show_hidden, sort_by)
+				files, cwd, selected = load(show_hidden, sort_by)
 				cursor = clamp(index_of(files, string(made[:mn])), 0, max(len(files)-1, 0))
 				if err != nil {
 					msg = fmt.tprintf("create failed: %v", err)
@@ -241,6 +254,7 @@ HELP := [?]string{
 	"  .  show or hide dotfiles",
 	"",
 	"  v  peek inside a file",
+	"  space  tick a file; d, y and x then act on every ticked one",
 	"  a  create, end the name with / for a directory",
 	"  r  rename          d  delete",
 	"  y  copy            x  cut            p  paste",
@@ -375,6 +389,80 @@ test_create_file_never_clobbers :: proc(t: ^testing.T) {
 	testing.expect(t, create_file(path) != nil, "creating over an existing file must fail")
 }
 
+// the ticked entries, or just the highlighted one when nothing is ticked
+targets :: proc(files: []os.File_Info, selected: []bool, cursor: int) -> []os.File_Info {
+	out := make([dynamic]os.File_Info, 0, len(files), context.temp_allocator)
+	for f, i in files {
+		if selected[i] {
+			append(&out, f)
+		}
+	}
+	if len(out) == 0 && len(files) > 0 {
+		append(&out, files[cursor])
+	}
+	return out[:]
+}
+
+// a name reads better than "1 items" when only one thing is going to happen
+describe :: proc(files: []os.File_Info) -> string {
+	if len(files) == 1 {
+		return files[0].name
+	}
+	return fmt.tprintf("%d items", len(files))
+}
+
+// one clipboard entry into cwd. the returned text is "" when it worked.
+paste_one :: proc(src, cwd: string, cut: bool) -> (name: string, why: string) {
+	name = os.base(src)
+	dbuf: [4096]byte
+	dn := join_path(dbuf[:], cwd, name)
+	if dn == 0 {
+		return name, "path too long to paste"
+	}
+	if string(dbuf[:dn]) == src {
+		// copy_file opens dst with O_TRUNC while src is still open, and empties it
+		return name, "source and destination are the same"
+	}
+	if os.is_directory(src) && under(cwd, src) {
+		// the copy would walk into the copy it is making, until the path runs out
+		return name, "cannot paste a directory into itself"
+	}
+	// rename and copy_file both clobber the target silently, so do the asking ourselves
+	if os.exists(name) && !confirm(fmt.tprintf("overwrite %s? (y/N) ", name)) {
+		return name, "skipped"
+	}
+
+	err: os.Error
+	switch {
+	case cut:
+		// moves files and directories alike, but only within one filesystem
+		err = os.rename(src, name)
+	case os.is_directory(src):
+		err = os.copy_directory_all(name, src)
+	case:
+		// dst first, src second: backwards from cp(1) and from os.rename above
+		err = os.copy_file(name, src)
+	}
+	if err != nil {
+		return name, fmt.tprintf("paste failed: %v", err)
+	}
+	return name, ""
+}
+
+@(test)
+test_targets :: proc(t: ^testing.T) {
+	files := []os.File_Info{{name = "a"}, {name = "b"}, {name = "c"}}
+
+	got := targets(files, []bool{false, false, false}, 1)
+	testing.expect(t, len(got) == 1 && got[0].name == "b", "no ticks means act on the highlighted entry")
+
+	got = targets(files, []bool{true, false, true}, 1)
+	testing.expect(t, len(got) == 2, "ticks win over the cursor")
+	testing.expect(t, got[0].name == "a" && got[1].name == "c", "ticked entries keep listing order")
+
+	testing.expect(t, len(targets(files[:0], []bool{}, 0)) == 0, "an empty listing has no targets")
+}
+
 // a plain buffer, not the temp allocator, so the result survives the next load()
 join_path :: proc(buf: []byte, dir, name: string) -> int {
 	sep := "/" if dir != "/" else ""
@@ -414,7 +502,7 @@ test_paste_guards :: proc(t: ^testing.T) {
 }
 
 // shortcut: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
-load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: string) {
+load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: string, selected: []bool) {
 	free_all(context.temp_allocator)
 	cwd, _ = os.get_working_directory(context.temp_allocator)
 	files, _ = os.read_all_directory_by_path(".", context.temp_allocator)
@@ -430,6 +518,8 @@ load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: s
 	}
 
 	sort_files(files, sort_by)
+	// tied to the listing it belongs to, so navigating or re-sorting drops the ticks
+	selected = make([]bool, len(files), context.temp_allocator)
 	return
 }
 
@@ -625,7 +715,7 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // shortcut: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int, msg: string, sort_by: Sort) {
+draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
 
@@ -637,11 +727,12 @@ draw :: proc(cwd: string, files: []os.File_Info, cursor, offset, rows, cols: int
 	for i in offset ..< min(offset+rows, len(files)) {
 		f := files[i]
 		slash := "/" if f.type == .Directory else ""
-		name := fit(f.name, cols-1) // -1 leaves room for the slash
+		mark := "*" if selected[i] else " "
+		name := fit(f.name, cols-2) // -2 leaves room for the mark and the slash
 		if i == cursor {
-			fmt.printfln("\x1b[7m%s%s\x1b[0m", name, slash)
+			fmt.printfln("\x1b[7m%s%s%s\x1b[0m", mark, name, slash)
 		} else {
-			fmt.printfln("%s%s", name, slash)
+			fmt.printfln("%s%s%s", mark, name, slash)
 		}
 	}
 
