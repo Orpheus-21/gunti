@@ -43,13 +43,13 @@ main :: proc() {
 	// the query outlives the arena ask() used, so n can repeat it later
 	query: [256]byte
 	query_n := 0
-	files, cwd, selected := load(show_hidden, sort_by)
+	files, cwd, selected, links := load(show_hidden, sort_by)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by, local)
+		draw(cwd, files, selected, links, cursor, offset, rows, cols, msg, sort_by, local)
 
 		key, ok := read_key()
 		if !ok {
@@ -77,11 +77,11 @@ main :: proc() {
 		case 's':
 			sort_by = Sort((int(sort_by) + 1) % len(Sort))
 			cursor, offset = 0, 0
-			files, cwd, selected = load(show_hidden, sort_by)
+			files, cwd, selected, links = load(show_hidden, sort_by)
 		case '.':
 			show_hidden = !show_hidden
 			cursor, offset = 0, 0
-			files, cwd, selected = load(show_hidden, sort_by)
+			files, cwd, selected, links = load(show_hidden, sort_by)
 		case 'l', '\r', '\n':
 			if len(files) > 0 {
 				// try to walk in first: chdir fails on a regular file, and symlinked dirs work free
@@ -92,7 +92,7 @@ main :: proc() {
 				} else {
 					eerr = open_in_editor(files[cursor].name, &cooked, &raw)
 				}
-				files, cwd, selected = load(show_hidden, sort_by)
+				files, cwd, selected, links = load(show_hidden, sort_by)
 				cursor = clamp(cursor, 0, max(len(files)-1, 0))
 				if eerr != nil {
 					msg = fmt.tprintf("could not run $EDITOR: %v", eerr)
@@ -103,7 +103,7 @@ main :: proc() {
 			leaving: [256]byte
 			n := copy(leaving[:], os.base(cwd))
 			if os.set_working_directory("..") == nil {
-				files, cwd, selected = load(show_hidden, sort_by)
+				files, cwd, selected, links = load(show_hidden, sort_by)
 				cursor, offset = index_of(files, string(leaving[:n])), 0
 			}
 		case 'd':
@@ -118,7 +118,7 @@ main :: proc() {
 						}
 					}
 					total := len(victims)
-					files, cwd, selected = load(show_hidden, sort_by)
+					files, cwd, selected, links = load(show_hidden, sort_by)
 					cursor = clamp(cursor, 0, max(len(files)-1, 0))
 					if failed > 0 {
 						msg = fmt.tprintf("%d of %d could not be deleted", failed, total)
@@ -139,7 +139,7 @@ main :: proc() {
 					if err := os.rename(old, name); err != nil {
 						msg = fmt.tprintf("rename failed: %v", err)
 					} else {
-						files, cwd, selected = load(show_hidden, sort_by)
+						files, cwd, selected, links = load(show_hidden, sort_by)
 						cursor = clamp(index_of(files, string(renamed[:rn])), 0, max(len(files)-1, 0))
 					}
 				}
@@ -192,7 +192,7 @@ main :: proc() {
 				if pn == 0 && clip_cut {
 					clip_n = 0
 				}
-				files, cwd, selected = load(show_hidden, sort_by)
+				files, cwd, selected, links = load(show_hidden, sort_by)
 				cursor = clamp(index_of(files, string(last[:ln])), 0, max(len(files)-1, 0))
 				if pn > 0 {
 					msg = fmt.tprintf("%s", string(problem[:pn]))
@@ -216,7 +216,7 @@ main :: proc() {
 				} else {
 					err = create_file(name)
 				}
-				files, cwd, selected = load(show_hidden, sort_by)
+				files, cwd, selected, links = load(show_hidden, sort_by)
 				cursor = clamp(index_of(files, string(made[:mn])), 0, max(len(files)-1, 0))
 				if err != nil {
 					msg = fmt.tprintf("create failed: %v", err)
@@ -229,7 +229,7 @@ main :: proc() {
 			if len(files) > 0 {
 				kn = copy(keep[:], files[cursor].name)
 			}
-			files, cwd, selected = load(show_hidden, sort_by)
+			files, cwd, selected, links = load(show_hidden, sort_by)
 			cursor = clamp(index_of(files, string(keep[:kn])), 0, max(len(files)-1, 0))
 		case 'c':
 			if path, got := ask("go to: ", ""); got {
@@ -238,7 +238,7 @@ main :: proc() {
 					msg = fmt.tprintf("cannot go there: %v", err)
 				} else {
 					cursor, offset = 0, 0
-					files, cwd, selected = load(show_hidden, sort_by)
+					files, cwd, selected, links = load(show_hidden, sort_by)
 				}
 			}
 		case 'v':
@@ -554,7 +554,7 @@ test_paste_guards :: proc(t: ^testing.T) {
 }
 
 // shortcut: whole listing re-read on every navigation, cache it when a directory is slow enough to notice
-load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: string, selected: []bool) {
+load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: string, selected: []bool, links: []string) {
 	free_all(context.temp_allocator)
 	cwd, _ = os.get_working_directory(context.temp_allocator)
 	files, _ = os.read_all_directory_by_path(".", context.temp_allocator)
@@ -572,6 +572,24 @@ load :: proc(show_hidden: bool, sort_by: Sort) -> (files: []os.File_Info, cwd: s
 	sort_files(files, sort_by)
 	// tied to the listing it belongs to, so navigating or re-sorting drops the ticks
 	selected = make([]bool, len(files), context.temp_allocator)
+
+	// resolved here, not in draw: reading a link hits the disk and allocates, and
+	// draw runs on every single keypress. "" means the entry is not a link.
+	links = make([]string, len(files), context.temp_allocator)
+	for f, i in files {
+		if f.type != .Symlink {
+			continue
+		}
+		target, err := os.read_link(f.name, context.temp_allocator)
+		if err != nil {
+			links[i] = " -> ?"
+		} else if os.exists(f.name) {
+			// exists() follows the link, so a false here means it points at nothing
+			links[i] = fmt.tprintf(" -> %s", target)
+		} else {
+			links[i] = fmt.tprintf(" -> %s (broken)", target)
+		}
+	}
 	return
 }
 
@@ -757,12 +775,16 @@ local_date :: proc(t: time.Time, local: ^datetime.TZ_Region, buf: []byte) -> str
 
 // name on the left, the sorted-by value on the right, padded between so the
 // cursor highlight covers the whole row instead of stopping at the name
-row_text :: proc(buf: []byte, mark, name, slash, right: string, cols: int) -> string {
-	// 3 covers the mark, the slash and at least one space before the right column
-	fitted := fit(name, max(cols-len(right)-3, 1))
+row_text :: proc(buf: []byte, mark, name, tail, right: string, cols: int) -> string {
+	// 2 covers the mark and at least one space before the right column. the name
+	// yields to the tail first, then the tail itself is trimmed to what is left,
+	// or a long link target pushes the row past the terminal width.
+	room := max(cols-len(right)-2, 1)
+	fitted := fit(name, max(room-len(tail), 1))
+	trimmed := fit(tail, max(room-len(fitted), 0))
 	n := copy(buf, mark)
 	n += copy(buf[n:], fitted)
-	n += copy(buf[n:], slash)
+	n += copy(buf[n:], trimmed)
 	for n < min(cols-len(right), len(buf)) {
 		buf[n] = ' '
 		n += 1
@@ -782,6 +804,14 @@ test_row_text :: proc(t: ^testing.T) {
 
 	got = row_text(buf[:], "*", "dir", "/", "dir", 20)
 	testing.expect(t, strings.has_prefix(got, "*dir/"), "the tick and the slash both survive")
+
+	got = row_text(buf[:], " ", "mylink", " -> /some/target", "link", 40)
+	testing.expect(t, len(got) == 40, "a link row still fills the width exactly")
+	testing.expect(t, strings.contains(got, "mylink -> /some/target"), "the link target is shown in full")
+
+	// a target longer than the row must not push the line past the terminal width
+	wide := row_text(buf[:], " ", "n", " -> /a/very/long/target/path/that/keeps/going", "link", 20)
+	testing.expect(t, len(wide) <= 20, "a long link target never overflows the row")
 
 	long := row_text(buf[:], " ", "a-very-long-file-name-that-will-not-fit.txt", "", "1.5KiB", 20)
 	testing.expect(t, len(long) <= 20, "a long name is truncated, never wrapped")
@@ -820,7 +850,7 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // shortcut: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
+draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, links: []string, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
 
@@ -836,8 +866,12 @@ draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offse
 	row: [512]byte
 	for i in offset ..< min(offset+rows, len(files)) {
 		f := files[i]
-		slash := "/" if f.type == .Directory else ""
 		mark := "*" if selected[i] else " "
+		// a directory gets its slash, a link shows where it points
+		tail := links[i]
+		if f.type == .Directory {
+			tail = "/"
+		}
 
 		// the right column shows whatever the listing is sorted by, so the order is readable
 		rbuf: [32]byte
@@ -845,6 +879,9 @@ draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offse
 		switch {
 		case sort_by == .Time:
 			right = local_date(f.modification_time, local, rbuf[:])
+		case f.type == .Symlink:
+			// the byte length of a link is its target string, which nobody wants to read
+			right = "link"
 		case f.type == .Directory:
 			right = "dir"
 		case:
@@ -852,7 +889,7 @@ draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offse
 			right = fmt.bprintf(rbuf[:], "%M", f.size)
 		}
 
-		line := row_text(row[:], mark, f.name, slash, right, cols)
+		line := row_text(row[:], mark, f.name, tail, right, cols)
 		if i == cursor {
 			fmt.printfln("\x1b[7m%s\x1b[0m", line)
 		} else {
