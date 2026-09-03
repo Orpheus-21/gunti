@@ -345,8 +345,9 @@ main :: proc() {
 			}
 		case '?':
 			help()
-		case '/', 'n':
-			// n is the same jump with the previous query, so they share everything below
+		case '/', 'n', 'N':
+			// n and N are the same jump with the previous query, N just walks the
+			// other way, so all three share everything below
 			if key == '/' {
 				q, got := ask("/", "")
 				if !got {
@@ -357,8 +358,9 @@ main :: proc() {
 			if query_n == 0 {
 				break
 			}
-			// always move to the next match, so a hit under the cursor doesn't look like nothing happened
-			if i, found := find(files, string(query[:query_n]), cursor+1); found {
+			step := -1 if key == 'N' else 1
+			// always move off the current row, so a hit under the cursor doesn't look like nothing happened
+			if i, found := find(files, string(query[:query_n]), cursor+step, step); found {
 				cursor = i
 			} else {
 				msg = fmt.tprintf("not found: %s", string(query[:query_n]))
@@ -385,7 +387,7 @@ HELP := [?]string{
 	"  c  go to a path, ~ included",
 	"  R  re-read the folder from disk",
 	"",
-	"  /  search          n  next match",
+	"  /  search          n  next match      N  previous match",
 	"  s  cycle sort: name / size / time",
 	"  .  show or hide dotfiles",
 	"",
@@ -474,13 +476,14 @@ help :: proc() {
 
 // case-insensitive substring match, wrapping past the end so the last hit leads back to the first
 // shortcut: lowercases into the temp arena, which only load() frees, so a long search spree holds memory
-find :: proc(files: []Entry, query: string, start: int) -> (int, bool) {
+find :: proc(files: []Entry, query: string, start, step: int) -> (int, bool) {
 	if len(files) == 0 || query == "" {
 		return 0, false
 	}
 	q, _ := strings.to_lower(query, context.temp_allocator)
 	for k in 0 ..< len(files) {
-		i := (start + k) % len(files)
+		// %% is the wrapped modulo, so stepping backwards past zero lands at the end
+		i := (start + step*k) %% len(files)
 		name, _ := strings.to_lower(files[i].name, context.temp_allocator)
 		if strings.contains(name, q) {
 			return i, true
@@ -493,16 +496,26 @@ find :: proc(files: []Entry, query: string, start: int) -> (int, bool) {
 test_find :: proc(t: ^testing.T) {
 	files := []Entry{{info = {name = "alpha.txt"}}, {info = {name = "README"}}, {info = {name = "notes.md"}}}
 
-	i, ok := find(files, "readme", 0)
+	i, ok := find(files, "readme", 0, 1)
 	testing.expect(t, ok && i == 1, "must match regardless of case")
-	i, ok = find(files, "ALPHA", 2)
+	i, ok = find(files, "ALPHA", 2, 1)
 	testing.expect(t, ok && i == 0, "must wrap past the end")
-	i, ok = find(files, "notes.md", 2)
+	i, ok = find(files, "notes.md", 2, 1)
 	testing.expect(t, ok && i == 2, "must find a match at the starting index")
-	_, ok = find(files, "zzz", 0)
+	_, ok = find(files, "zzz", 0, 1)
 	testing.expect(t, !ok, "a miss must report not found")
-	_, ok = find(files[:0], "a", 0)
+	_, ok = find(files[:0], "a", 0, 1)
 	testing.expect(t, !ok, "an empty listing must not divide by zero")
+
+	// backwards
+	i, ok = find(files, "alpha", 2, -1)
+	testing.expect(t, ok && i == 0, "searching back finds an earlier match")
+	i, ok = find(files, "notes", 0, -1)
+	testing.expect(t, ok && i == 2, "searching back wraps past zero to the end")
+	i, ok = find(files, "readme", -1, -1)
+	testing.expect(t, ok && i == 1, "a negative start is wrapped, not clamped")
+	_, ok = find(files, "zzz", 1, -1)
+	testing.expect(t, !ok, "a miss backwards is still a miss")
 }
 
 // .Excl makes the kernel refuse a name that already exists. os.create would
