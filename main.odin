@@ -3,6 +3,7 @@ package gunti
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:strings"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
@@ -28,6 +29,9 @@ main :: proc() {
 	clip: [4096]byte
 	clip_n := 0
 	clip_cut := false
+	// the query outlives the arena ask() used, so n can repeat it later
+	query: [256]byte
+	query_n := 0
 	files, cwd := load(show_hidden)
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
@@ -191,8 +195,59 @@ main :: proc() {
 					msg = fmt.tprintf("create failed: %v", err)
 				}
 			}
+		case '/', 'n':
+			// n is the same jump with the previous query, so they share everything below
+			if key == '/' {
+				q, got := ask("/", "")
+				if !got {
+					break
+				}
+				query_n = copy(query[:], q)
+			}
+			if query_n == 0 {
+				break
+			}
+			// always move to the next match, so a hit under the cursor doesn't look like nothing happened
+			if i, found := find(files, string(query[:query_n]), cursor+1); found {
+				cursor = i
+			} else {
+				msg = fmt.tprintf("not found: %s", string(query[:query_n]))
+			}
 		}
 	}
+}
+
+// case-insensitive substring match, wrapping past the end so the last hit leads back to the first
+// ponytail: lowercases into the temp arena, which only load() frees, so a long search spree holds memory
+find :: proc(files: []os.File_Info, query: string, start: int) -> (int, bool) {
+	if len(files) == 0 || query == "" {
+		return 0, false
+	}
+	q, _ := strings.to_lower(query, context.temp_allocator)
+	for k in 0 ..< len(files) {
+		i := (start + k) % len(files)
+		name, _ := strings.to_lower(files[i].name, context.temp_allocator)
+		if strings.contains(name, q) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+@(test)
+test_find :: proc(t: ^testing.T) {
+	files := []os.File_Info{{name = "alpha.txt"}, {name = "README"}, {name = "notes.md"}}
+
+	i, ok := find(files, "readme", 0)
+	testing.expect(t, ok && i == 1, "must match regardless of case")
+	i, ok = find(files, "ALPHA", 2)
+	testing.expect(t, ok && i == 0, "must wrap past the end")
+	i, ok = find(files, "notes.md", 2)
+	testing.expect(t, ok && i == 2, "must find a match at the starting index")
+	_, ok = find(files, "zzz", 0)
+	testing.expect(t, !ok, "a miss must report not found")
+	_, ok = find(files[:0], "a", 0)
+	testing.expect(t, !ok, "an empty listing must not divide by zero")
 }
 
 // .Excl makes the kernel refuse a name that already exists. os.create would
