@@ -102,11 +102,14 @@ main :: proc() {
 					if os.exists(name) && !confirm(fmt.tprintf("overwrite %s? (y/N) ", name)) {
 						break
 					}
+					// ask() answers live in the arena load() frees, so keep a copy for the highlight
+					renamed: [256]byte
+					rn := copy(renamed[:], name)
 					if err := os.rename(old, name); err != nil {
 						msg = fmt.tprintf("rename failed: %v", err)
 					} else {
 						files, cwd = load(show_hidden)
-						cursor = clamp(index_of(files, name), 0, max(len(files)-1, 0))
+						cursor = clamp(index_of(files, string(renamed[:rn])), 0, max(len(files)-1, 0))
 					}
 				}
 			}
