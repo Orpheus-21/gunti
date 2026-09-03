@@ -6,6 +6,9 @@ import "core:slice"
 import "core:strings"
 import "core:sys/linux"
 import "core:sys/posix"
+import "core:time"
+import "core:time/datetime"
+import tz "core:time/timezone"
 import "core:testing"
 
 main :: proc() {
@@ -21,6 +24,12 @@ main :: proc() {
 	raw.c_cc[.VTIME] = 0
 	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &raw)
 	fmt.print("\x1b[?25l")
+
+	// loaded once and kept for the whole run: file times come back as UTC, and a
+	// listing that says yesterday for a file you touched this evening is just wrong
+	// /etc/localtime directly, because the proc that names the local zone is
+	// package-private. nil on failure, which just means dates read as UTC.
+	local, _ := tz.region_load_from_file("/etc/localtime", "local")
 
 	cursor, offset := 0, 0
 	show_hidden := false
@@ -40,7 +49,7 @@ main :: proc() {
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by)
+		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by, local)
 
 		key, ok := read_key()
 		if !ok {
@@ -719,6 +728,59 @@ term_size :: proc() -> (rows: int, cols: int) {
 	return int(ws.row), int(ws.col)
 }
 
+// file times come back as UTC. render them in the viewer's zone instead, since a
+// listing that says yesterday for a file touched this evening is simply wrong.
+// falls back to UTC when the zone will not load, which beats refusing to draw.
+local_date :: proc(t: time.Time, local: ^datetime.TZ_Region, buf: []byte) -> string {
+	dt, ok := time.time_to_datetime(t)
+	if !ok {
+		return "?"
+	}
+	if local != nil {
+		// per timestamp, so a file from the other side of a daylight-saving switch still reads right
+		if shifted, moved := tz.datetime_to_tz(dt, local); moved {
+			dt = shifted
+		}
+	}
+	return fmt.bprintf(buf, "%02d-%02d-%04d", dt.day, dt.month, dt.year)
+}
+
+// name on the left, the sorted-by value on the right, padded between so the
+// cursor highlight covers the whole row instead of stopping at the name
+row_text :: proc(buf: []byte, mark, name, slash, right: string, cols: int) -> string {
+	// 3 covers the mark, the slash and at least one space before the right column
+	fitted := fit(name, max(cols-len(right)-3, 1))
+	n := copy(buf, mark)
+	n += copy(buf[n:], fitted)
+	n += copy(buf[n:], slash)
+	for n < min(cols-len(right), len(buf)) {
+		buf[n] = ' '
+		n += 1
+	}
+	n += copy(buf[n:], right)
+	return string(buf[:n])
+}
+
+@(test)
+test_row_text :: proc(t: ^testing.T) {
+	buf: [512]byte
+
+	got := row_text(buf[:], " ", "a.txt", "", "10B", 20)
+	testing.expect(t, len(got) == 20, "row fills the width so the highlight covers it")
+	testing.expect(t, strings.has_prefix(got, " a.txt"), "name sits on the left")
+	testing.expect(t, strings.has_suffix(got, "10B"), "the sorted-by value sits on the right")
+
+	got = row_text(buf[:], "*", "dir", "/", "dir", 20)
+	testing.expect(t, strings.has_prefix(got, "*dir/"), "the tick and the slash both survive")
+
+	long := row_text(buf[:], " ", "a-very-long-file-name-that-will-not-fit.txt", "", "1.5KiB", 20)
+	testing.expect(t, len(long) <= 20, "a long name is truncated, never wrapped")
+	testing.expect(t, strings.has_suffix(long, "1.5KiB"), "the right column survives truncation")
+
+	narrow := row_text(buf[:], " ", "name", "", "10B", 4)
+	testing.expect(t, len(narrow) > 0, "a very narrow terminal still produces a row")
+}
+
 // shortcut: counts runes, not display columns, so CJK and emoji still overflow
 fit :: proc(s: string, width: int) -> string {
 	if width <= 0 {
@@ -748,7 +810,7 @@ perms :: proc(p: os.Permissions) -> (out: [9]byte) {
 }
 
 // shortcut: full redraw per keypress, diff the rows if it ever feels slow
-draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort) {
+draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
 	fmt.print("\x1b[2J\x1b[H")
 	fmt.printfln("\x1b[1m%s\x1b[0m", fit(cwd, cols))
 
@@ -761,15 +823,30 @@ draw :: proc(cwd: string, files: []os.File_Info, selected: []bool, cursor, offse
 		return
 	}
 
+	row: [512]byte
 	for i in offset ..< min(offset+rows, len(files)) {
 		f := files[i]
 		slash := "/" if f.type == .Directory else ""
 		mark := "*" if selected[i] else " "
-		name := fit(f.name, cols-2) // -2 leaves room for the mark and the slash
+
+		// the right column shows whatever the listing is sorted by, so the order is readable
+		rbuf: [32]byte
+		right: string
+		switch {
+		case sort_by == .Time:
+			right = local_date(f.modification_time, local, rbuf[:])
+		case f.type == .Directory:
+			right = "dir"
+		case:
+			// bprintf into a stack buffer: draw runs every keypress and must not allocate
+			right = fmt.bprintf(rbuf[:], "%M", f.size)
+		}
+
+		line := row_text(row[:], mark, f.name, slash, right, cols)
 		if i == cursor {
-			fmt.printfln("\x1b[7m%s%s%s\x1b[0m", mark, name, slash)
+			fmt.printfln("\x1b[7m%s\x1b[0m", line)
 		} else {
-			fmt.printfln("%s%s%s", mark, name, slash)
+			fmt.printfln("%s", line)
 		}
 	}
 
