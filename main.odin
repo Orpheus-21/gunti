@@ -71,6 +71,14 @@ main :: proc() {
 	show_hidden := false
 	sort_by := Sort.Name
 	msg: string
+	// an absent or unreadable config leaves the defaults above exactly as they were.
+	// the complaint goes in a plain buffer: read_dir below frees the temp arena
+	// that parse_config wrote it into.
+	problem: [256]byte
+	problem_n := 0
+	if text, err := os.read_entire_file(config_path(context.temp_allocator), context.temp_allocator); err == nil {
+		problem_n = copy(problem[:], parse_config(string(text), &sort_by, &show_hidden))
+	}
 	// the clipboard has to outlive load(), which frees the arena entry names live in.
 	// sized for many paths now that a tick list can be pasted in one go.
 	clip: [64 * 1024]byte
@@ -80,6 +88,7 @@ main :: proc() {
 	query: [256]byte
 	query_n := 0
 	all, view, files, selected, cwd := read_dir(show_hidden, sort_by)
+	msg = string(problem[:problem_n])
 	for {
 		// re-asked every frame so a resized window just works, no sigwinch handler
 		rows, cols := term_size()
@@ -552,6 +561,84 @@ test_parse_mode :: proc(t: ^testing.T) {
 	testing.expect(t, !ok, "symbolic modes are refused, not half-parsed")
 	_, ok = parse_mode("64x")
 	testing.expect(t, !ok, "trailing junk is refused")
+}
+
+// $XDG_CONFIG_HOME first, then the usual ~/.config. no file is not an error.
+config_path :: proc(allocator: runtime.Allocator) -> string {
+	if base := os.get_env("XDG_CONFIG_HOME", allocator); base != "" {
+		return fmt.tprintf("%s/gunti/config", base)
+	}
+	return fmt.tprintf("%s/.config/gunti/config", os.get_env("HOME", allocator))
+}
+
+// line based on purpose: no format library, no dependency, and the whole grammar
+// fits in this proc. returns the first line it could not understand, "" if fine.
+// there is deliberately no "set editor": $EDITOR already does that job, so the
+// core has no business growing a second way to say it.
+parse_config :: proc(text: string, sort_by: ^Sort, show_hidden: ^bool) -> string {
+	rest := text
+	line_no := 0
+	for line in strings.split_lines_iterator(&rest) {
+		line_no += 1
+		trimmed := strings.trim_space(line)
+		if trimmed == "" || trimmed[0] == '#' {
+			continue
+		}
+
+		f := strings.fields(trimmed, context.temp_allocator)
+		if len(f) != 3 || f[0] != "set" {
+			return fmt.tprintf("config line %d: expected: set <option> <value>", line_no)
+		}
+
+		switch f[1] {
+		case "sort":
+			switch f[2] {
+			case "name":
+				sort_by^ = .Name
+			case "size":
+				sort_by^ = .Size
+			case "time":
+				sort_by^ = .Time
+			case:
+				return fmt.tprintf("config line %d: sort must be name, size or time", line_no)
+			}
+		case "hidden":
+			switch f[2] {
+			case "true":
+				show_hidden^ = true
+			case "false":
+				show_hidden^ = false
+			case:
+				return fmt.tprintf("config line %d: hidden must be true or false", line_no)
+			}
+		case:
+			return fmt.tprintf("config line %d: unknown option %s", line_no, f[1])
+		}
+	}
+	return ""
+}
+
+@(test)
+test_parse_config :: proc(t: ^testing.T) {
+	sort_by := Sort.Name
+	hidden := false
+
+	// comments, blank lines and stray whitespace are all fine
+	problem := parse_config("# a comment\n\n  set sort size  \nset hidden true\n", &sort_by, &hidden)
+	testing.expect(t, problem == "", "a valid config reports no problem")
+	testing.expect(t, sort_by == .Size, "sort was applied")
+	testing.expect(t, hidden, "hidden was applied")
+
+	// an empty config must change nothing
+	sort_by, hidden = .Time, false
+	testing.expect(t, parse_config("", &sort_by, &hidden) == "", "empty config is valid")
+	testing.expect(t, sort_by == .Time && !hidden, "empty config changes nothing")
+
+	testing.expect(t, parse_config("set sort sideways\n", &sort_by, &hidden) != "", "a bad value is reported")
+	testing.expect(t, parse_config("set hidden yes\n", &sort_by, &hidden) != "", "hidden takes true or false only")
+	testing.expect(t, parse_config("set nosuchoption 1\n", &sort_by, &hidden) != "", "an unknown option is reported")
+	testing.expect(t, parse_config("sort size\n", &sort_by, &hidden) != "", "a line must start with set")
+	testing.expect(t, parse_config("set sort\n", &sort_by, &hidden) != "", "a truncated line is reported")
 }
 
 // the ticked entries, or just the highlighted one when nothing is ticked
