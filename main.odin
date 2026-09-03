@@ -3,6 +3,7 @@ package gunti
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "base:runtime"
 import "core:sys/linux"
@@ -225,6 +226,31 @@ main :: proc() {
 					msg = fmt.tprintf("create failed: %v", err)
 				}
 			}
+		case 'm':
+			if len(files) > 0 {
+				picked := targets(files, selected, cursor)
+				cur: [8]byte
+				now := fmt.bprintf(cur[:], "%o", transmute(u32)files[cursor].mode)
+				if text, got := ask(fmt.tprintf("mode for %s: ", describe(picked)), now); got {
+					perms, valid := parse_mode(text)
+					if !valid {
+						msg = fmt.tprintf("not an octal mode: %s", text)
+						break
+					}
+					failed := 0
+					for f in picked {
+						if os.change_mode(f.name, perms) != nil {
+							failed += 1
+						}
+					}
+					total := len(picked)
+					all, view, files, selected, cwd = read_dir(show_hidden, sort_by)
+					cursor = clamp(cursor, 0, max(len(files)-1, 0))
+					if failed > 0 {
+						msg = fmt.tprintf("%d of %d refused", failed, total)
+					}
+				}
+			}
 		case 'R':
 			// keep the highlight on the same entry: a refresh can shift every index
 			keep: [256]byte
@@ -290,6 +316,7 @@ HELP := [?]string{
 	"  space  tick a file; d, y and x then act on every ticked one",
 	"  a  create, end the name with / for a directory",
 	"  r  rename          d  delete",
+	"  m  change permissions, octal like 644",
 	"  y  copy            x  cut            p  paste",
 	"",
 	"  ?  this help       q  quit",
@@ -442,6 +469,44 @@ test_expand_home :: proc(t: ^testing.T) {
 	testing.expect(t, expand_home("sub", "/home/x") == "sub", "relative paths pass through")
 	testing.expect(t, expand_home("~xyz", "/home/x") == "~xyz", "only ~ alone or ~/ expands")
 	testing.expect(t, expand_home("", "/home/x") == "", "empty stays empty")
+}
+
+// "644" -> the nine permission bits. octal only: chmod's symbolic forms like
+// "u+x" are a small language of their own and this is not the place for it.
+parse_mode :: proc(s: string) -> (os.Permissions, bool) {
+	used: int
+	v, ok := strconv.parse_uint(s, 8, &used)
+	// used != len(s) catches trailing junk, which parse_uint alone accepts
+	if !ok || used != len(s) || v > 0o777 {
+		return {}, false
+	}
+	return transmute(os.Permissions)u32(v), true
+}
+
+@(test)
+test_parse_mode :: proc(t: ^testing.T) {
+	p, ok := parse_mode("644")
+	testing.expect(t, ok, "644 parses")
+	testing.expect(t, p == {.Read_User, .Write_User, .Read_Group, .Read_Other}, "644 is rw-r--r--")
+
+	p, ok = parse_mode("755")
+	testing.expect(t, ok && .Execute_User in p && .Execute_Other in p, "755 is executable")
+
+	p, ok = parse_mode("0")
+	testing.expect(t, ok && p == {}, "0 clears every bit")
+
+	_, ok = parse_mode("777")
+	testing.expect(t, ok, "777 is the maximum")
+	_, ok = parse_mode("888")
+	testing.expect(t, !ok, "8 is not an octal digit")
+	_, ok = parse_mode("1000")
+	testing.expect(t, !ok, "anything beyond the nine bits is refused")
+	_, ok = parse_mode("")
+	testing.expect(t, !ok, "empty is refused")
+	_, ok = parse_mode("rwx")
+	testing.expect(t, !ok, "symbolic modes are refused, not half-parsed")
+	_, ok = parse_mode("64x")
+	testing.expect(t, !ok, "trailing junk is refused")
 }
 
 // the ticked entries, or just the highlighted one when nothing is ticked
