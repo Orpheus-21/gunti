@@ -9,6 +9,7 @@ import "base:runtime"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
+import "core:unicode"
 import "core:time/datetime"
 import tz "core:time/timezone"
 import "core:testing"
@@ -1320,15 +1321,22 @@ row_text :: proc(buf: []byte, mark, name, tail, right: string, cols: int) -> str
 	// 2 covers the mark and at least one space before the right column. the name
 	// yields to the tail first, then the tail itself is trimmed to what is left,
 	// or a long link target pushes the row past the terminal width.
-	room := max(cols-len(right)-2, 1)
-	fitted := fit(name, max(room-len(tail), 1))
-	trimmed := fit(tail, max(room-len(fitted), 0))
+	// widths are in terminal cells throughout: len() counts bytes, and a name
+	// with one CJK rune has more bytes than cells
+	rw := str_width(right)
+	room := max(cols-rw-2, 1)
+	fitted := fit(name, max(room-str_width(tail), 1))
+	trimmed := fit(tail, max(room-str_width(fitted), 0))
+
 	n := copy(buf, mark)
 	n += copy(buf[n:], fitted)
 	n += copy(buf[n:], trimmed)
-	for n < min(cols-len(right), len(buf)) {
+
+	used := str_width(mark) + str_width(fitted) + str_width(trimmed)
+	for used < cols-rw && n < len(buf) {
 		buf[n] = ' '
 		n += 1
+		used += 1
 	}
 	n += copy(buf[n:], right)
 	return string(buf[:n])
@@ -1339,7 +1347,7 @@ test_row_text :: proc(t: ^testing.T) {
 	buf: [512]byte
 
 	got := row_text(buf[:], " ", "a.txt", "", "10B", 20)
-	testing.expect(t, len(got) == 20, "row fills the width so the highlight covers it")
+	testing.expect(t, str_width(got) == 20, "row fills the width so the highlight covers it")
 	testing.expect(t, strings.has_prefix(got, " a.txt"), "name sits on the left")
 	testing.expect(t, strings.has_suffix(got, "10B"), "the sorted-by value sits on the right")
 
@@ -1347,34 +1355,98 @@ test_row_text :: proc(t: ^testing.T) {
 	testing.expect(t, strings.has_prefix(got, "*dir/"), "the tick and the slash both survive")
 
 	got = row_text(buf[:], " ", "mylink", " -> /some/target", "link", 40)
-	testing.expect(t, len(got) == 40, "a link row still fills the width exactly")
+	testing.expect(t, str_width(got) == 40, "a link row still fills the width exactly")
 	testing.expect(t, strings.contains(got, "mylink -> /some/target"), "the link target is shown in full")
 
 	// a target longer than the row must not push the line past the terminal width
 	wide := row_text(buf[:], " ", "n", " -> /a/very/long/target/path/that/keeps/going", "link", 20)
-	testing.expect(t, len(wide) <= 20, "a long link target never overflows the row")
+	testing.expect(t, str_width(wide) <= 20, "a long link target never overflows the row")
 
 	long := row_text(buf[:], " ", "a-very-long-file-name-that-will-not-fit.txt", "", "1.5KiB", 20)
-	testing.expect(t, len(long) <= 20, "a long name is truncated, never wrapped")
+	testing.expect(t, str_width(long) <= 20, "a long name is truncated, never wrapped")
 	testing.expect(t, strings.has_suffix(long, "1.5KiB"), "the right column survives truncation")
 
 	narrow := row_text(buf[:], " ", "name", "", "10B", 4)
 	testing.expect(t, len(narrow) > 0, "a very narrow terminal still produces a row")
+
+	// the case that was broken: a CJK name must fill exactly the same cells as ascii
+	cjk := row_text(buf[:], " ", "日本語のファイル.txt", "", "10B", 40)
+	testing.expect(t, str_width(cjk) == 40, "a CJK row fills the width in cells, not bytes")
+	testing.expect(t, len(cjk) > 40, "and it genuinely uses more bytes than cells")
 }
 
 // shortcut: counts runes, not display columns, so CJK and emoji still overflow
+// terminals draw CJK, Hangul and emoji two cells wide. counting runes instead
+// makes every row holding such a name come out short, so the right column goes
+// ragged and the cursor highlight stops before the edge.
+// shortcut: the common wide ranges, not the full Unicode width tables. covers
+// CJK, Hangul, fullwidth forms and the main emoji blocks.
+rune_width :: proc(r: rune) -> int {
+	switch {
+	case r == 0, unicode.is_combining(r):
+		// a combining mark is drawn on top of the rune before it, taking no cell
+		return 0
+	case r < 0x1100:
+		// everything latin, greek and cyrillic, which is the common case
+		return 1
+	}
+
+	switch r {
+	case 0x1100 ..= 0x115F, // hangul jamo
+	     0x2E80 ..= 0x303E, // cjk radicals, kangxi
+	     0x3041 ..= 0x33FF, // hiragana, katakana, cjk symbols
+	     0x3400 ..= 0x4DBF, // cjk extension A
+	     0x4E00 ..= 0x9FFF, // cjk unified ideographs
+	     0xA000 ..= 0xA4CF, // yi
+	     0xAC00 ..= 0xD7A3, // hangul syllables
+	     0xF900 ..= 0xFAFF, // cjk compatibility ideographs
+	     0xFE10 ..= 0xFE19, 0xFE30 ..= 0xFE6F, // vertical and compatibility forms
+	     0xFF00 ..= 0xFF60, 0xFFE0 ..= 0xFFE6, // fullwidth forms
+	     0x1F300 ..= 0x1F64F, 0x1F900 ..= 0x1F9FF, // emoji
+	     0x20000 ..= 0x2FFFD, 0x30000 ..= 0x3FFFD: // cjk extensions B and beyond
+		return 2
+	}
+	return 1
+}
+
+str_width :: proc(s: string) -> int {
+	w := 0
+	for r in s {
+		w += rune_width(r)
+	}
+	return w
+}
+
+// truncates on a cell boundary, never leaving half a wide rune at the edge
 fit :: proc(s: string, width: int) -> string {
 	if width <= 0 {
 		return ""
 	}
 	n := 0
-	for _, i in s {
-		if n == width {
+	for r, i in s {
+		w := rune_width(r)
+		if n + w > width {
 			return s[:i]
 		}
-		n += 1
+		n += w
 	}
 	return s
+}
+
+@(test)
+test_rune_width :: proc(t: ^testing.T) {
+	testing.expect(t, str_width("abc") == 3, "ascii is one cell each")
+	testing.expect(t, str_width("") == 0, "empty is zero")
+	testing.expect(t, str_width("café") == 4, "accented latin stays one cell")
+	testing.expect(t, str_width("日本語") == 6, "CJK is two cells each")
+	testing.expect(t, str_width("한글") == 4, "hangul is two cells each")
+	testing.expect(t, str_width("🎉") == 2, "emoji is two cells")
+	testing.expect(t, str_width("a日b") == 4, "mixed widths add up")
+
+	testing.expect(t, fit("日本語", 4) == "日本", "truncates on a cell boundary")
+	testing.expect(t, fit("日本語", 3) == "日", "never leaves half a wide rune")
+	testing.expect(t, fit("日本語", 6) == "日本語", "an exact fit keeps everything")
+	testing.expect(t, fit("abc", 2) == "ab", "ascii truncation is unchanged")
 }
 
 perms :: proc(p: os.Permissions) -> (out: [9]byte) {
