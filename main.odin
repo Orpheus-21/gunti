@@ -166,8 +166,55 @@ main :: proc() {
 					msg = fmt.tprintf("paste failed: %v", err)
 				}
 			}
+		case 'a':
+			// a trailing / means directory, so one key covers both without a second prompt
+			if raw, got := ask("create (end with / for a directory): ", ""); got {
+				is_dir := raw[len(raw)-1] == '/'
+				name := raw[:len(raw)-1] if is_dir else raw
+				// ask() answers live in the arena load() frees, so keep a copy for the highlight
+				made: [256]byte
+				mn := copy(made[:], name)
+
+				err: os.Error
+				if is_dir {
+					// ponytail: one level only, make_directory_all if nested paths ever get typed
+					err = os.make_directory(name)
+				} else {
+					err = create_file(name)
+				}
+				files, cwd = load(show_hidden)
+				cursor = clamp(index_of(files, string(made[:mn])), 0, max(len(files)-1, 0))
+				if err != nil {
+					msg = fmt.tprintf("create failed: %v", err)
+				}
+			}
 		}
 	}
+}
+
+// .Excl makes the kernel refuse a name that already exists. os.create would
+// truncate it instead, quietly emptying whatever was there.
+create_file :: proc(name: string) -> os.Error {
+	f := os.open(name, {.Read, .Write, .Create, .Excl}, os.Permissions_Default_File) or_return
+	return os.close(f)
+}
+
+@(test)
+test_create_file_never_clobbers :: proc(t: ^testing.T) {
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	if !testing.expect_value(t, terr, nil) {
+		return
+	}
+	dir, derr := os.make_directory_temp(tmp, "gunti", context.temp_allocator)
+	if !testing.expect_value(t, derr, nil) {
+		return
+	}
+	defer os.remove_all(dir)
+
+	path := fmt.tprintf("%s/a.txt", dir)
+	testing.expect_value(t, create_file(path), nil)
+	// an error here means the file was never opened, so nothing could have been truncated
+	testing.expect(t, create_file(path) != nil, "creating over an existing file must fail")
 }
 
 // a plain buffer, not the temp allocator, so the result survives the next load()
