@@ -63,7 +63,7 @@ on_signal :: proc "c" (sig: posix.Signal) {
 
 // bumped by hand at release time. overridable at build time with
 // -define:GUNTI_VERSION=..., so a packager can mark a snapshot build.
-VERSION :: #config(GUNTI_VERSION, "0.18.0")
+VERSION :: #config(GUNTI_VERSION, "0.19.0")
 
 main :: proc() {
 	// arguments are handled before the terminal is touched, so they work in a

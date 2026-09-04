@@ -125,6 +125,11 @@ saving is correct.
 
 `$XDG_CONFIG_HOME/gunti/config`, or `~/.config/gunti/config`.
 
+[`config.example`](config.example) is a working file with every option and a
+set of useful bindings. Copy it and edit:
+
+    install -Dm644 config.example ~/.config/gunti/config
+
 No file means defaults. A line it cannot parse is reported with its line number and
 the rest of the file still applies.
 
