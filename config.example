@@ -1,0 +1,63 @@
+# gunti config. copy to ~/.config/gunti/config and edit.
+#
+# blank lines and lines starting with # are ignored. a line gunti cannot parse
+# is reported with its line number, and the rest of the file still applies.
+
+# ---------------------------------------------------------------- options ---
+
+# where the listing starts: name, size or time
+set sort name
+
+# show dotfiles at startup. the . key toggles it either way
+set hidden false
+
+# ----------------------------------------------------------------- colour ---
+# black red green yellow blue magenta cyan white, the same eight prefixed with
+# bright-, and none. plain blue is hard to read on some terminals, so
+# bright-blue is often the better choice for directories.
+#
+# NO_COLOR in the environment turns all of this off and wins over these lines.
+
+set color dir     blue
+set color link    cyan
+set color exec    green
+set color broken  red
+
+# --------------------------------------------------------------- bindings ---
+# map <key> <shell command>
+#
+#   "$@"  the ticked files, or the highlighted one if none are ticked
+#   $f    the highlighted file
+#   $d    the current directory
+#
+# a ! in front hands the terminal over and waits for a keypress afterwards.
+# use it for anything that prints or asks something. without it the command
+# runs unseen, which is what you want for a clipboard copy.
+#
+# a binding replaces the built-in key, so "map d ..." takes over delete.
+# every key below is one gunti does not already use.
+
+# delete to the trash instead of removing outright. needs trash-cli.
+map D trash-put -- "$@"
+
+# copy the full path of the highlighted file to the clipboard.
+# wayland; use xclip -selection clipboard on X11.
+map Y sh -c 'printf "%s/%s" "$d" "$f" | wl-copy'
+
+# extract an archive, showing what it does
+map E !tar xvf "$f"
+
+# page through a file with line numbers
+map L !less -N "$f"
+
+# stage the selection in git
+map A !git add -- "$@"
+
+# drop into a shell in this directory, back to gunti when you exit
+map S !${SHELL:-sh}
+
+# rename using the shell's own prompt, since sh can ask questions
+map T !read -p "new name: " n && mv -- "$f" "$n"
+
+# disk usage of the selection, largest first
+map U !du -sh -- "$@" | sort -rh
