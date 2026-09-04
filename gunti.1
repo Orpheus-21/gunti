@@ -1,0 +1,263 @@
+.TH GUNTI 1 "2026-09-04" "gunti 0.18.0" "User Commands"
+.SH NAME
+gunti \- minimal terminal file manager
+.SH SYNOPSIS
+.B gunti
+.RI [ directory ]
+.br
+.B gunti \-\-version
+.SH DESCRIPTION
+.B gunti
+lists a directory in the terminal and moves through it with the keyboard.
+It browses, sorts, searches, and does the usual file operations. Anything it
+does not do is bound to a shell command in the config file.
+.PP
+With no argument it opens the current directory. Given a directory, it opens
+that instead. A path that does not exist, is not a directory, or cannot be read
+is reported on standard error and exits 1.
+.SH OPTIONS
+.TP
+.B \-\-version
+Print the version, licence and project URL, then exit. Nothing is drawn and the
+terminal is not touched, so this is safe in a pipe.
+.SH KEYS
+.SS Moving
+.TP
+.B j, k
+Down, up.
+.TP
+.B g, G
+Top, bottom.
+.TP
+.B h
+Parent directory.
+.TP
+.B l
+Enter a directory, or open a file in
+.BR $EDITOR .
+.TP
+.B c
+Prompt for a path and go there.
+.B ~
+is accepted.
+.TP
+.B R
+Re-read the directory from disk.
+.SS Finding
+.TP
+.B /
+Prompt for text and jump to the next matching entry. Case insensitive, matches
+anywhere in the name.
+.TP
+.B n, N
+Next match, previous match. Both wrap.
+.TP
+.B s
+Cycle the sort order: name, size, time. Size sorts largest first, time newest
+first. Directories always group at the top.
+.TP
+.B .
+Show or hide dotfiles.
+.SS Acting
+.TP
+.B space
+Tick the highlighted entry and step down.
+.BR d ,
+.BR y ,
+.B x
+and
+.B m
+then act on every ticked entry. With nothing ticked they act on the highlighted
+one. Ticks clear whenever the listing reloads.
+.TP
+.B a
+Create. End the name with
+.B /
+to make a directory. Refuses to overwrite an existing name.
+.TP
+.B r
+Rename, prompting with the current name.
+.TP
+.B d
+Delete, after confirmation. Non-empty directories are refused.
+.TP
+.B m
+Change permissions. Octal only, such as
+.BR 644 .
+.TP
+.B y, x, p
+Copy, cut, paste. Pasting prompts before overwriting anything.
+.TP
+.B v
+Page through a file. This is a default binding, not built in, and can be
+replaced.
+.TP
+.B !
+Prompt for a shell command and run it. See
+.B SHELL COMMANDS
+below.
+.SS Other
+.TP
+.B ?
+Show the key list.
+.TP
+.B q
+Quit. Ctrl-C also quits.
+.PP
+Arrow keys work as
+.BR hjkl ,
+backspace as
+.BR h ,
+and enter as
+.BR l .
+.SH CONFIGURATION
+.B gunti
+reads
+.I $XDG_CONFIG_HOME/gunti/config
+if that variable is set, otherwise
+.IR ~/.config/gunti/config .
+No file means defaults. A line it cannot parse is reported with its line number
+and the rest of the file still applies.
+.PP
+Blank lines and lines beginning with
+.B #
+are ignored.
+.SS Options
+.PP
+.nf
+set sort    name|size|time
+set hidden  true|false
+set color   dir|link|exec|broken <colour>
+.fi
+.PP
+Colours are
+.BR black ", " red ", " green ", " yellow ", " blue ", " magenta ", " cyan ", "
+.BR white ,
+the same eight prefixed with
+.BR bright- ,
+and
+.BR none .
+Defaults match
+.BR ls (1):
+blue directories, cyan symlinks, green executables, red broken symlinks. The
+highlighted row is not coloured, because reverse video over a colour turns the
+colour into a background.
+.PP
+There is no
+.B set editor
+option.
+.B $EDITOR
+already does that.
+.SS Bindings
+.PP
+.nf
+map <key> <shell command>
+.fi
+.PP
+A binding overrides the built-in key. Built-in actions cannot be bound to other
+keys; only shell commands can be bound.
+.SH SHELL COMMANDS
+Commands run through
+.BR sh (1).
+Selected files are passed as positional arguments, never substituted into the
+command text, so names containing spaces, quotes, newlines or leading dashes
+pass through intact.
+.TP
+.B \(dq$@\(dq
+The ticked files, or the highlighted one if none are ticked.
+.TP
+.B $f
+The highlighted file.
+.TP
+.B $d
+The current directory.
+.PP
+A
+.B !
+before the command hands over the terminal and waits for a keypress afterwards.
+Use it for anything that prints or asks something. Without it the command runs
+unseen, which is what a clipboard copy wants.
+.PP
+.nf
+map D  rm \-rf \-\- "$@"
+map Y  wl\-copy < "$f"
+map L  !less "$f"
+map R  !read \-p "new name: " n && mv \-\- "$f" "$n"
+.fi
+.SH ENVIRONMENT
+.TP
+.B EDITOR
+Used by
+.BR l
+on a regular file. Falls back to
+.BR vi .
+May contain arguments.
+.TP
+.B PAGER
+Used by the default
+.B v
+binding. Falls back to
+.BR less .
+.TP
+.B NO_COLOR
+If set to any value, all colour is disabled. This is checked after the config,
+so it cannot be overridden by a
+.B set color
+line.
+.TP
+.B GUNTI_CD
+If set to a file path, the directory
+.B gunti
+ended in is written there on exit. Unset, nothing is written. No process can
+change its parent shell's directory, so a wrapper function is needed:
+.PP
+.nf
+gunti() {
+  local d target
+  d=$(mktemp)
+  GUNTI_CD="$d" command gunti "$@"
+  target=$(cat "$d"); rm \-f "$d"
+  [ \-n "$target" ] && cd "$target"
+}
+.fi
+.TP
+.B XDG_CONFIG_HOME
+Where the config is looked for. Defaults to
+.IR ~/.config .
+.SH FILES
+.TP
+.I ~/.config/gunti/config
+Configuration.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal exit.
+.TP
+.B 1
+The directory given on the command line could not be opened.
+.TP
+.B 128+n
+Killed by signal
+.IR n .
+The terminal is restored first.
+.SH LIMITATIONS
+No progress or cancellation on large copies; the display blocks until done.
+Deleting a non-empty directory fails, by design; bind
+.B rm \-rf
+for the other behaviour. Cutting across filesystems fails, because
+.BR rename (2)
+cannot move between mount points. Built-in keys cannot be remapped. No image
+previews, tabs, panes, bookmarks, bulk rename, mouse, icons or plugins, none of
+which are planned. Wide character widths cover CJK, Hangul, fullwidth forms and
+the common emoji blocks, not the full Unicode tables. Filenames are assumed to
+be UTF-8. Linux only.
+.SH SEE ALSO
+.BR ls (1),
+.BR sh (1),
+.BR less (1),
+.BR rename (2)
+.SH BUGS
+https://github.com/Orpheus-21/gunti/issues
+.SH COPYRIGHT
+Copyright \(co 2026 Orpheus\-21. Licensed under the GNU GPL version 3 or later.
+There is NO WARRANTY, to the extent permitted by law.

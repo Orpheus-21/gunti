@@ -55,9 +55,12 @@ Or build it:
     make
     sudo make install
 
-`make install` honours `DESTDIR` and `PREFIX`:
+`make install` puts the binary, the licence and the man page in place, and
+honours `DESTDIR` and `PREFIX`:
 
     make install DESTDIR=/tmp/stage PREFIX=/usr
+
+    man gunti
 
 ## build
 
