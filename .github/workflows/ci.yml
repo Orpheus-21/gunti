@@ -64,4 +64,10 @@ jobs:
       - name: Attach binary and checksum to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" gunti gunti.sha256 --clobber
+        # upload fails outright if no release exists for the tag, so a bare
+        # "git push --tags" would build the binary and then drop it. create the
+        # release first if it is missing, and a tag alone is enough to publish.
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" gunti gunti.sha256 --clobber
