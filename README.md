@@ -73,12 +73,16 @@ config parsing, search, sorting and the permission parser.
 
     ./gunti
 
-Opens the directory you launch it from.
+With no argument, opens the directory you launch it from. Give it a directory
+to start there instead:
+
+    gunti ~/Downloads
+    gunti /etc
+
+A path that does not exist, is not a directory, or cannot be read is reported
+on stderr and exits 1 rather than opening something else.
 
     gunti --version
-
-Every other argument is ignored, so `gunti /some/path` opens the current
-directory, not that path.
 
 ## keys
 

@@ -66,14 +66,27 @@ on_signal :: proc "c" (sig: posix.Signal) {
 VERSION :: #config(GUNTI_VERSION, "0.18.0")
 
 main :: proc() {
-	// answered before the terminal is touched, so it works in a pipe and cannot
-	// leave a half-configured terminal behind
+	// arguments are handled before the terminal is touched, so they work in a
+	// pipe and a bad one cannot leave a half-configured terminal behind
+	start_dir := ""
 	for arg in os.args[1:] {
-		if arg == "--version" {
+		switch {
+		case arg == "--version":
 			fmt.printfln("gunti %s", VERSION)
 			fmt.println("GPL-3.0-or-later. No warranty.")
 			fmt.println("https://github.com/Orpheus-21/gunti")
 			return
+		case start_dir == "":
+			// the shell expands ~ before we ever see it, so there is nothing to do here
+			start_dir = arg
+		}
+	}
+
+	// refuse loudly rather than opening the wrong directory in silence
+	if start_dir != "" {
+		if err := os.set_working_directory(start_dir); err != nil {
+			fmt.eprintfln("gunti: %s: %v", start_dir, err)
+			os.exit(1)
 		}
 	}
 
