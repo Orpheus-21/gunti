@@ -61,7 +61,22 @@ on_signal :: proc "c" (sig: posix.Signal) {
 	linux.exit_group(128 + i32(sig))
 }
 
+// bumped by hand at release time. overridable at build time with
+// -define:GUNTI_VERSION=..., so a packager can mark a snapshot build.
+VERSION :: #config(GUNTI_VERSION, "0.18.0")
+
 main :: proc() {
+	// answered before the terminal is touched, so it works in a pipe and cannot
+	// leave a half-configured terminal behind
+	for arg in os.args[1:] {
+		if arg == "--version" {
+			fmt.printfln("gunti %s", VERSION)
+			fmt.println("GPL-3.0-or-later. No warranty.")
+			fmt.println("https://github.com/Orpheus-21/gunti")
+			return
+		}
+	}
+
 	cooked: posix.termios
 	posix.tcgetattr(posix.STDIN_FILENO, &cooked)
 	cooked_termios, cooked_saved = cooked, true
