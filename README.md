@@ -73,8 +73,12 @@ config parsing, search, sorting and the permission parser.
 
     ./gunti
 
-Opens the directory you launch it from. Command line arguments are ignored, so
-`gunti /some/path` opens the current directory, not that path.
+Opens the directory you launch it from.
+
+    gunti --version
+
+Every other argument is ignored, so `gunti /some/path` opens the current
+directory, not that path.
 
 ## keys
 
