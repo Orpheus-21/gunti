@@ -116,7 +116,7 @@ main :: proc() {
 	local, _ := tz.region_load_from_file("/etc/localtime", "local")
 
 	cursor, offset := 0, 0
-	cfg := Config{sort = .Name}
+	cfg := Config{sort = .Name, colors = DEFAULT_PALETTE}
 	msg: string
 	// an absent or unreadable config leaves the defaults above exactly as they were.
 	// the complaint goes in a plain buffer: read_dir below frees the temp arena
@@ -127,6 +127,11 @@ main :: proc() {
 	parse_config(DEFAULT_CONFIG, &cfg)
 	if text, err := os.read_entire_file(config_path(context.temp_allocator), context.temp_allocator); err == nil {
 		problem_n = copy(problem[:], parse_config(string(text), &cfg))
+	}
+	// no-color.org: any value at all means no colour, and it is checked after the
+	// config so a "set color" line cannot quietly override the user's wish
+	if os.get_env("NO_COLOR", context.temp_allocator) != "" {
+		cfg.colors = {}
 	}
 	// the clipboard has to outlive load(), which frees the arena entry names live in.
 	// sized for many paths now that a tick list can be pasted in one go.
@@ -147,7 +152,7 @@ main :: proc() {
 		rows, cols := term_size()
 		rows = max(rows-2, 1)
 		offset = max(min(offset, cursor), cursor-rows+1, 0)
-		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by, local)
+		draw(cwd, files, selected, cursor, offset, rows, cols, msg, sort_by, local, cfg.colors)
 
 		key, ok := read_key()
 		if !ok {
@@ -448,6 +453,7 @@ HELP := [?]string{
 	"  arrows work as hjkl, backspace as h, enter as l",
 	"",
 	"  ~/.config/gunti/config:  set sort name|size|time,  set hidden true|false",
+	"                          set color dir|link|exec|broken <colour>",
 	"                          map <key> <command>,  ! prefix = show output",
 	"                          in commands: \"$@\" = the files to act on",
 }
@@ -612,6 +618,103 @@ DEFAULT_CONFIG :: `
 map v !${PAGER:-less} -- "$f"
 `
 
+// SGR foreground codes. "" anywhere means leave that kind of entry uncoloured.
+Palette :: struct {
+	dir:    string,
+	link:   string,
+	exec:   string,
+	broken: string,
+}
+
+// what ls has trained everyone to expect
+DEFAULT_PALETTE :: Palette {
+	dir    = "34",
+	link   = "36",
+	exec   = "32",
+	broken = "31",
+}
+
+// eight colours and their bright forms. plain blue on a black terminal is hard
+// to read, which is why the bright ones are worth having.
+color_code :: proc(name: string) -> (string, bool) {
+	switch name {
+	case "none":           return "", true
+	case "black":          return "30", true
+	case "red":            return "31", true
+	case "green":          return "32", true
+	case "yellow":         return "33", true
+	case "blue":           return "34", true
+	case "magenta":        return "35", true
+	case "cyan":           return "36", true
+	case "white":          return "37", true
+	case "bright-black":   return "90", true
+	case "bright-red":     return "91", true
+	case "bright-green":   return "92", true
+	case "bright-yellow":  return "93", true
+	case "bright-blue":    return "94", true
+	case "bright-magenta": return "95", true
+	case "bright-cyan":    return "96", true
+	case "bright-white":   return "97", true
+	}
+	return "", false
+}
+
+// first match wins, so a broken link is red rather than cyan
+entry_color :: proc(e: Entry, p: Palette) -> string {
+	switch {
+	case e.type == .Directory:
+		return p.dir
+	case e.broken:
+		return p.broken
+	case e.type == .Symlink:
+		return p.link
+	case .Execute_User in e.mode:
+		return p.exec
+	}
+	return ""
+}
+
+@(test)
+test_entry_color :: proc(t: ^testing.T) {
+	p := DEFAULT_PALETTE
+
+	dir := Entry{info = {type = .Directory}}
+	testing.expect(t, entry_color(dir, p) == p.dir, "a directory takes the directory colour")
+
+	link := Entry{info = {type = .Symlink}}
+	testing.expect(t, entry_color(link, p) == p.link, "a working link takes the link colour")
+
+	dead := Entry{info = {type = .Symlink}, broken = true}
+	testing.expect(t, entry_color(dead, p) == p.broken, "broken beats link, or a dead link looks healthy")
+
+	exe := Entry{info = {type = .Regular, mode = {.Execute_User}}}
+	testing.expect(t, entry_color(exe, p) == p.exec, "an executable takes the executable colour")
+
+	plain := Entry{info = {type = .Regular}}
+	testing.expect(t, entry_color(plain, p) == "", "an ordinary file is left alone")
+
+	// a directory that is also executable, which almost all of them are
+	both := Entry{info = {type = .Directory, mode = {.Execute_User}}}
+	testing.expect(t, entry_color(both, p) == p.dir, "directory wins over the executable bit")
+
+	off := entry_color(dir, Palette{})
+	testing.expect(t, off == "", "an empty palette colours nothing")
+}
+
+@(test)
+test_color_code :: proc(t: ^testing.T) {
+	c, ok := color_code("blue")
+	testing.expect(t, ok && c == "34", "blue is 34")
+	c, ok = color_code("bright-blue")
+	testing.expect(t, ok && c == "94", "bright blue is 94")
+	c, ok = color_code("none")
+	testing.expect(t, ok && c == "", "none is valid and means no colour")
+	_, ok = color_code("puce")
+	testing.expect(t, !ok, "an unknown colour is refused, not silently ignored")
+	_, ok = color_code("")
+	testing.expect(t, !ok, "empty is refused")
+}
+
 Binding :: struct {
 	key:         byte,
 	command:     string,
@@ -623,6 +726,7 @@ Binding :: struct {
 Config :: struct {
 	sort:     Sort,
 	hidden:   bool,
+	colors:   Palette,
 	bindings: [dynamic]Binding,
 }
 
@@ -670,8 +774,36 @@ parse_config :: proc(text: string, cfg: ^Config, allocator := context.allocator)
 		}
 
 		f := strings.fields(trimmed, context.temp_allocator)
-		if len(f) != 3 || f[0] != "set" {
+		if len(f) < 3 || f[0] != "set" {
 			return fmt.tprintf("config line %d: expected: set <option> <value>, or map <key> <command>", line_no)
+		}
+
+		// colour is the one option taking two words: what, then which colour
+		if f[1] == "color" {
+			if len(f) != 4 {
+				return fmt.tprintf("config line %d: expected: set color dir|link|exec|broken <colour>", line_no)
+			}
+			code, known := color_code(f[3])
+			if !known {
+				return fmt.tprintf("config line %d: unknown colour %s", line_no, f[3])
+			}
+			switch f[2] {
+			case "dir":
+				cfg.colors.dir = code
+			case "link":
+				cfg.colors.link = code
+			case "exec":
+				cfg.colors.exec = code
+			case "broken":
+				cfg.colors.broken = code
+			case:
+				return fmt.tprintf("config line %d: colour must be for dir, link, exec or broken", line_no)
+			}
+			continue
+		}
+
+		if len(f) != 3 {
+			return fmt.tprintf("config line %d: expected: set <option> <value>", line_no)
 		}
 
 		switch f[1] {
@@ -886,6 +1018,7 @@ test_paste_guards :: proc(t: ^testing.T) {
 Entry :: struct {
 	using info: os.File_Info,
 	link:       string, // "" unless this is a symlink
+	broken:     bool,   // a symlink pointing at nothing
 }
 
 // the only proc here that touches the disk. it reads everything, hidden files
@@ -909,6 +1042,7 @@ read_dir :: proc(show_hidden: bool, sort_by: Sort) -> (all, view, files: []Entry
 			e.link = fmt.tprintf(" -> %s", target)
 		case:
 			e.link = fmt.tprintf(" -> %s (broken)", target)
+			e.broken = true
 		}
 	}
 
@@ -1497,7 +1631,7 @@ frame_buf: [64 * 1024]byte
 // clearing then repainting shows a blank flash on a real terminal. instead each
 // line erases its own tail, and one erase-to-bottom at the end removes whatever
 // a previously longer listing left behind.
-draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region) {
+draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows, cols: int, msg: string, sort_by: Sort, local: ^datetime.TZ_Region, colors: Palette) {
 	b: bufio.Writer
 	bufio.writer_init_with_buf(&b, os.to_stream(os.stdout), frame_buf[:])
 	w := bufio.writer_to_writer(&b)
@@ -1544,9 +1678,14 @@ draw :: proc(cwd: string, files: []Entry, selected: []bool, cursor, offset, rows
 		}
 
 		line := row_text(row[:], mark, f.name, tail, right, cols)
-		if i == cursor {
+		switch {
+		case i == cursor:
+			// the highlight already marks this row, and reverse video over a
+			// colour just turns the colour into a background
 			fmt.wprintfln(w, "\x1b[7m%s\x1b[0m\x1b[K", line, flush = false)
-		} else {
+		case entry_color(f, colors) != "":
+			fmt.wprintfln(w, "\x1b[%sm%s\x1b[0m\x1b[K", entry_color(f, colors), line, flush = false)
+		case:
 			fmt.wprintfln(w, "%s\x1b[K", line, flush = false)
 		}
 	}

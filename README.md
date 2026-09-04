@@ -66,8 +66,8 @@ Or build it:
     make release    # static, stripped, with a checksum
     make clean
 
-14 tests. They cover the directory reader against `core:os`, path and layout maths,
-config parsing, search, sorting and the permission parser.
+16 tests. They cover the directory reader against `core:os`, path and layout maths,
+config parsing, search, sorting, colour selection and the permission parser.
 
 ## usage
 
@@ -129,10 +129,23 @@ the rest of the file still applies.
     set sort    name|size|time
     set hidden  true|false
 
+    # colour
+    set color dir|link|exec|broken  <colour>
+
     # bindings
     map <key> <shell command>
 
 There is no `set editor`. `$EDITOR` already does that.
+
+Colours are `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`,
+`white`, the same eight prefixed with `bright-`, and `none`. Directories,
+symlinks, executables and broken symlinks are coloured; everything else is
+left alone. The highlighted row is not coloured, because reverse video over a
+colour turns the colour into a background.
+
+Defaults match `ls`: blue directories, cyan symlinks, green executables, red
+broken links. Setting `NO_COLOR` to any value turns all of it off, and it wins
+over the config.
 
 ## shell commands
 
@@ -204,7 +217,6 @@ These numbers are against `ls`, not against other file managers. `ranger`, `lf` 
 
 ## what it does not do
 
-- No colour. Directories, symlinks and executables all render the same.
 - No progress bar or cancellation on large copies. The display blocks until done.
 - Deleting a non-empty directory fails. Delete uses `rmdir` semantics on purpose.
   Bind `rm -rf` if you want the other behaviour.
