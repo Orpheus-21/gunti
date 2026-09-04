@@ -1,43 +1,201 @@
 # gunti
 
-A terminal file manager in Odin. No ncurses, no dependencies — just `core:os`,
-`core:sys/posix` for raw mode, and ANSI escapes.
+A terminal file manager. Browse and manage files with the keyboard, inside a terminal window.
 
-It browses: move the highlight, walk into
-directories, walk back out, scroll through listings bigger than the screen. It
-does not copy, move, delete, rename, or preview anything.
+## Introduction
+
+Most people move files around by opening a window full of icons and dragging things
+with a mouse. gunti does the same job, but it draws a plain list of your files in a
+terminal and you move through it with the keyboard. No mouse, no icons, no pictures.
+
+You press a key to move down the list, another to open a folder, another to copy or
+delete. Because your hands never leave the keyboard, it is faster than clicking once
+you know the keys. There are 24 of them and pressing `?` shows the list at any time.
+
+The whole program is one file of about 1500 lines and it depends on nothing except
+the C library your system already has. It starts instantly, including in folders
+holding tens of thousands of files. It does not preview images, it has no tabs, and
+it will never grow a plugin system. When you want it to do something it does not do,
+you tell it to run an ordinary shell command instead, and you bind that command to a
+key in a config file.
+
+If you have used `ranger`, `lf` or `yazi`, this is the same category of tool, smaller.
+
+## requirements
+
+- Linux. Raw terminal mode uses POSIX termios and directory reading uses Linux
+  syscalls directly. No macOS, no BSD, no Windows, and no plans for them.
+- Odin `dev-2026-08` or newer, to build.
+- `sh`, for shell command bindings.
+- A pager for the `v` key. Uses `$PAGER`, falls back to `less`.
 
 ## build
 
     odin build . -out:gunti
 
+## test
+
+    odin test .
+
+14 tests. They cover the directory reader against `core:os`, path and layout maths,
+config parsing, search, sorting and the permission parser.
+
+## install
+
+Put the binary on your `PATH`:
+
+    ln -s "$PWD/gunti" ~/.local/bin/gunti
+
 ## usage
 
     ./gunti
 
-Browses whatever directory you launch it from. To use it anywhere, put it on
-your PATH:
-
-    ln -s "$PWD/gunti" ~/.local/bin/gunti
+Opens the directory you launch it from. Command line arguments are ignored, so
+`gunti /some/path` opens the current directory, not that path.
 
 ## keys
 
 | key | does |
 |---|---|
-| `j` / `↓` | down |
-| `k` / `↑` | up |
-| `l` / `→` / `Enter` | into the highlighted directory |
-| `h` / `←` / `Backspace` | up to the parent |
-| `q` / `Ctrl-C` | quit |
+| `j` `k` | down, up |
+| `g` `G` | top, bottom |
+| `h` | parent directory |
+| `l` | enter directory, or open file in `$EDITOR` |
+| `c` | go to a path, `~` accepted |
+| `R` | re-read the folder from disk |
+| `/` | search |
+| `n` `N` | next match, previous match |
+| `s` | cycle sort: name, size, time |
+| `.` | show or hide dotfiles |
+| `space` | tick a file |
+| `v` | page through a file |
+| `!` | run a shell command |
+| `a` | create, end the name with `/` for a directory |
+| `r` | rename |
+| `d` | delete |
+| `m` | change permissions, octal like `644` |
+| `y` `x` `p` | copy, cut, paste |
+| `?` | help |
+| `q` | quit |
 
-The bottom bar shows the highlighted entry's size and where you are in the
-listing. Long directories scroll; resizing the window is picked up on the next
-keypress.
+Arrows work as `hjkl`. Backspace works as `h`. Enter works as `l`. Ctrl-C quits.
 
-Changing directory only affects gunti. Your shell stays where it was — this is
-not a `cd` replacement and can't be one, since no process can change its
-parent's directory.
+`d`, `y`, `x` and `m` act on every ticked file. With nothing ticked they act on the
+highlighted one. Ticks clear whenever the listing reloads.
 
-## requirements
+The right hand column shows whatever you sorted by: size in name and size modes,
+modification date in time mode. Dates are local, resolved per timestamp, so daylight
+saving is correct.
 
-Odin `dev-2026-08` or newer. Linux — raw mode goes through posix termios.
+## config
+
+`$XDG_CONFIG_HOME/gunti/config`, or `~/.config/gunti/config`.
+
+No file means defaults. A line it cannot parse is reported with its line number and
+the rest of the file still applies.
+
+    # options
+    set sort    name|size|time
+    set hidden  true|false
+
+    # bindings
+    map <key> <shell command>
+
+There is no `set editor`. `$EDITOR` already does that.
+
+## shell commands
+
+`!` prompts for a command. `map` binds one to a key. Both run it through `sh`.
+
+Files reach the command as positional arguments, not as text:
+
+| | |
+|---|---|
+| `"$@"` | the ticked files, or the highlighted one if none are ticked |
+| `$f` | the highlighted file |
+| `$d` | the current directory |
+
+Use `"$@"` for anything acting on a selection. Filenames containing spaces, quotes,
+newlines or leading dashes pass through intact, because gunti never substitutes them
+into the command text.
+
+A `!` in front of a binding hands over the terminal and waits for a keypress
+afterwards. Use it for anything that prints or asks something. Without it the command
+runs unseen, which is what you want for a clipboard copy.
+
+    map D  rm -rf -- "$@"
+    map T  trash-put -- "$@"
+    map Y  wl-copy < "$f"
+    map E  tar xf "$f"
+    map L  !less "$f"
+    map G  !git add -- "$@"
+
+Bindings override built-in keys. `map d trash-put -- "$@"` replaces delete.
+
+The shell provides prompting, so renaming through a binding works:
+
+    map R !read -p "new name: " n && mv -- "$f" "$n"
+
+## leaving your shell in the directory you browsed to
+
+No process can change its parent shell's directory. gunti writes where it ended up,
+and your shell does the rest.
+
+Set `GUNTI_CD` to a file path and gunti writes its final directory there on exit.
+Unset, nothing happens.
+
+    gunti() {
+      local d target
+      d=$(mktemp)
+      GUNTI_CD="$d" command gunti "$@"
+      target=$(cat "$d"); rm -f "$d"
+      [ -n "$target" ] && cd "$target"
+    }
+
+## speed
+
+Measured on 50,000 files in one directory, average of three runs:
+
+| | |
+|---|---|
+| read the directory and draw it | 84 ms |
+| `ls -la` on the same directory | 238 ms |
+| re-sort, no disk access | 15 ms |
+| one keypress | 35 us |
+
+gunti reads directories with `getdents` plus one `fstatat` per entry. `core:os` opens
+and closes a file descriptor for every entry, which is three syscalls each instead of
+one. Changing sort order or toggling dotfiles rebuilds the view from memory and never
+touches the disk.
+
+These numbers are against `ls`, not against other file managers. `ranger`, `lf` and
+`yazi` have not been benchmarked here.
+
+## what it does not do
+
+- No colour. Directories, symlinks and executables all render the same.
+- No progress bar or cancellation on large copies. The display blocks until done.
+- Deleting a non-empty directory fails. Delete uses `rmdir` semantics on purpose.
+  Bind `rm -rf` if you want the other behaviour.
+- Cutting across filesystems fails. `rename` cannot move between mount points.
+- Built-in keys cannot be remapped to other keys. `map` binds shell commands only.
+- No image previews, tabs, panes, bookmarks, bulk rename, mouse, icons or plugins.
+  None of these are planned.
+- Wide character widths cover CJK, Hangul, fullwidth forms and the common emoji
+  blocks, not the full Unicode tables. Rare scripts may be off by a cell.
+- Filenames are assumed to be UTF-8.
+
+## design
+
+The core holds what only the core can do: reading and drawing the listing, moving
+around, sorting, ticking, searching, and running commands. Everything else is a
+config line.
+
+Previewing is a default binding, not built in, so a pager handles binary files and
+huge files properly instead of gunti approximating it. Copy, delete, rename and
+permissions stayed in the core because they need prefilled prompts and per file
+confirmation that a shell command cannot provide. All of them are overridable.
+
+## licence
+
+GNU GPL v3 or later. See [LICENSE](LICENSE).
