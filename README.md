@@ -23,28 +23,51 @@ If you have used `ranger`, `lf` or `yazi`, this is the same category of tool, sm
 
 ## requirements
 
-- Linux. Raw terminal mode uses POSIX termios and directory reading uses Linux
-  syscalls directly. No macOS, no BSD, no Windows, and no plans for them.
-- Odin `dev-2026-08` or newer, to build.
+Linux only. Raw terminal mode uses POSIX termios and directory reading uses
+Linux syscalls directly. No macOS, no BSD, no Windows, and no plans for them.
+
+To run: nothing. The released binary is statically linked and needs kernel 3.2
+or newer. There is no libc version requirement, so it works on musl systems
+such as Alpine. A binary you build yourself inherits whatever floor your own
+toolchain targets.
+
+Used if present, neither needed to start:
+
 - `sh`, for shell command bindings.
 - A pager for the `v` key. Uses `$PAGER`, falls back to `less`.
 
-## build
-
-    odin build . -out:gunti
-
-## test
-
-    odin test .
-
-14 tests. They cover the directory reader against `core:os`, path and layout maths,
-config parsing, search, sorting and the permission parser.
+To build: Odin `dev-2026-08` or newer.
 
 ## install
 
-Put the binary on your `PATH`:
+Download the binary from the latest release, verify it, put it on your `PATH`:
 
-    ln -s "$PWD/gunti" ~/.local/bin/gunti
+    curl -fLO https://github.com/Orpheus-21/gunti/releases/latest/download/gunti
+    curl -fLO https://github.com/Orpheus-21/gunti/releases/latest/download/gunti.sha256
+    sha256sum -c gunti.sha256
+    install -Dm755 gunti ~/.local/bin/gunti
+
+GitHub does not preserve the executable bit on release downloads, which is why
+`install` sets the mode.
+
+Or build it:
+
+    make
+    sudo make install
+
+`make install` honours `DESTDIR` and `PREFIX`:
+
+    make install DESTDIR=/tmp/stage PREFIX=/usr
+
+## build
+
+    make            # build
+    make test       # run the tests
+    make release    # static, stripped, with a checksum
+    make clean
+
+14 tests. They cover the directory reader against `core:os`, path and layout maths,
+config parsing, search, sorting and the permission parser.
 
 ## usage
 
